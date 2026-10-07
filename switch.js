@@ -6,17 +6,18 @@
 //   GET  /switch/{port}         -> make {port} the active target, redirect to /
 //   POST /switch/{start|stop|restart}/{name}
 //   GET  /switch/log/{name}     -> tail of run/{name}.log
+//   GET  /switch/api/state      -> {"target":3001,"name":"..."} (used by portctl)
 //   anything else               -> proxied to the active target (incl. WebSockets)
+// (/switch is proxy.path in servers.json)
 //
-// Usage: node switch.js   or   node launch.js --self      (env: PORT HOST TARGET)
+// Usage: node switch.js   or   portctl start proxy      (env: PORT HOST TARGET)
 
 const http = require('http');
 const net = require('net');
-const launcher = require('./launch');
+const launcher = require('./portctl');
 
 const UPSTREAM_HOST = '127.0.0.1';
 const ALLOW_UNREGISTERED = true; // allow /switch/{port} for ports not in servers.json
-const SWITCH_PATH = '/switch';
 
 // servers.json is re-read on every /switch page load; keep the last good copy if it breaks.
 let config;
@@ -31,6 +32,7 @@ if (!config) {
   process.exit(1);
 }
 
+const SWITCH_PATH = config.proxy.path;
 const LISTEN_PORT = Number(process.env.PORT) || config.proxy.port;
 const LISTEN_HOST = process.env.HOST || '0.0.0.0';
 
@@ -206,6 +208,10 @@ const server = http.createServer((req, res) => {
       return doAction(parts[0], parts[1], res);
     }
     if (parts.length === 2 && parts[0] === 'log') return showLog(parts[1], res);
+    if (parts.join('/') === 'api/state') {
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      return res.end(JSON.stringify({ target, name: nameOf(target) }));
+    }
   }
   proxy(req, res);
 });
