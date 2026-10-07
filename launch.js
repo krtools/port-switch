@@ -18,11 +18,14 @@ const RESERVED = new Set(['self', 'help', ...COMMANDS]);
 
 const USAGE = `usage:
   node launch.js [name]            start a server (prompts if no name)
+  node launch.js --all             start every server that isn't running
   node launch.js stop [name]       stop a server (prompts if no name)
+  node launch.js stop --all        stop every server
   node launch.js restart [name]
   node launch.js status
   node launch.js logs [name]       follow its log
-  Use --self in place of a name for the proxy itself (switch.js).`;
+  node launch.js --help            this message
+  Use --self in place of a name for the proxy itself (switch.js); --all leaves it alone.`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -177,6 +180,34 @@ async function cliStop(entry) {
   console.log((await stop(entry)) ? `stopped ${entry.name}` : `${entry.name} is not running`);
 }
 
+// --all: start every server (not the proxy) that is stopped, in parallel.
+async function cliStartAll(config) {
+  const entries = config.servers.filter((e) => e.cmd);
+  const states = await Promise.all(entries.map(getState));
+  const todo = entries.filter((e, i) => {
+    const { state, pid } = states[i];
+    if (state !== 'stopped') console.log(`${e.name}: skipped (${state}${pid ? `, pid ${pid}` : ''})`);
+    return state === 'stopped';
+  });
+  if (!todo.length) return console.log('nothing to start');
+
+  console.log(`starting ${todo.map((e) => e.name).join(', ')} ...`);
+  const results = await Promise.all(todo.map(async (e) => {
+    try { await start(e); return waitUp(e); } catch (err) { return `error: ${err.message}`; }
+  }));
+  todo.forEach((e, i) => {
+    const result = results[i];
+    const text = { up: `up on :${e.port}`, exited: `exited! (node launch.js logs ${e.name})`, timeout: 'started, not answering yet' };
+    console.log(`${e.name}: ${text[result] || result}`);
+    if (result !== 'up' && result !== 'timeout') process.exitCode = 1;
+  });
+}
+
+async function cliStopAll(config) {
+  const stopped = await Promise.all(config.servers.map(async (e) => (await stop(e)) && e.name));
+  console.log(stopped.some(Boolean) ? `stopped ${stopped.filter(Boolean).join(', ')}` : 'nothing running');
+}
+
 async function cliStatus(config) {
   const entries = [...config.servers, selfEntry(config)];
   const states = await Promise.all(entries.map(getState));
@@ -228,6 +259,11 @@ async function main(argv) {
   const config = loadConfig();
   const [cmd, name] = COMMANDS.includes(args[0]) ? args : ['start', args[0]];
   if (cmd === 'status') return cliStatus(config);
+  if (name === '--all') {
+    if (cmd === 'start') return cliStartAll(config);
+    if (cmd === 'stop') return cliStopAll(config);
+    throw new Error(`--all only works with start and stop`);
+  }
 
   const entry = name ? findEntry(config, name) : await pick(config, cmd);
   if (!entry) throw new Error(`unknown server "${name}" (have: ${config.servers.map((s) => s.name).join(', ')})`);
