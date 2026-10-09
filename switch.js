@@ -7,13 +7,19 @@
 //   POST /switch/{start|stop|restart}/{name}
 //   GET  /switch/log/{name}     -> tail of run/{name}.log
 //   GET  /switch/api/state      -> {"target":3001,"name":"..."} (used by portctl)
+//   GET|POST /switch/login, GET /switch/logout
 //   anything else               -> proxied to the active target (incl. WebSockets)
 // (/switch is proxy.path in servers.json)
 //
-// Usage: node switch.js   or   portctl start proxy      (env: PORT HOST TARGET)
+// Everything under /switch needs SWITCH_PASSWORD (from .env): log in once in the browser
+// for a long-lived cookie, or send "Authorization: Bearer <password>" (portctl does).
+//
+// Usage: node switch.js   or   portctl start proxy
+// env: PORT HOST TARGET SWITCH_PASSWORD SWITCH_COOKIE_DAYS (default 365)
 
 const http = require('http');
 const net = require('net');
+const crypto = require('crypto');
 const launcher = require('./portctl');
 
 const UPSTREAM_HOST = '127.0.0.1';
@@ -44,6 +50,112 @@ const tunnels = new Set();
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const entryOf = (port) => config.servers.find((s) => s.port === port);
 const nameOf = (port) => entryOf(port)?.name || `port ${port}`;
+
+// ---- auth ------------------------------------------------------------------
+// Cookie = "<expiry>.<HMAC(password, expiry)>": nothing stored server-side, and
+// changing the password logs every browser out.
+const PASSWORD = process.env.SWITCH_PASSWORD || '';
+const COOKIE = 'port_switch_auth';
+const COOKIE_MAX_AGE = (Number(process.env.SWITCH_COOKIE_DAYS) || 365) * 86400;
+const MAX_FAILURES = 20; // per 15 minutes, across all clients
+const failures = [];
+
+const sign = (exp) => crypto.createHmac('sha256', PASSWORD).update(`port-switch:${exp}`).digest('base64url');
+const sha = (s) => crypto.createHash('sha256').update(String(s)).digest();
+const safeEqual = (a, b) => crypto.timingSafeEqual(sha(a), sha(b));
+
+function getCookie(req, name) {
+  for (const part of (req.headers.cookie || '').split(';')) {
+    const [k, ...v] = part.trim().split('=');
+    if (k === name) return v.join('=');
+  }
+  return '';
+}
+
+function isAuthed(req) {
+  if (!PASSWORD) return false;
+  const bearer = /^Bearer (.+)$/.exec(req.headers.authorization || '')?.[1];
+  if (bearer) return safeEqual(bearer, PASSWORD);
+  const [exp, sig] = getCookie(req, COOKIE).split('.');
+  return Number(exp) > Date.now() / 1000 && !!sig && safeEqual(sig, sign(exp));
+}
+
+function authCookie(req, maxAge) {
+  const exp = Math.floor(Date.now() / 1000) + maxAge;
+  const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+  return `${COOKIE}=${maxAge ? `${exp}.${sign(exp)}` : ''}; Path=${SWITCH_PATH}; Max-Age=${maxAge}; HttpOnly; SameSite=Lax${secure}`;
+}
+
+function tooManyFailures() {
+  const cutoff = Date.now() - 15 * 60e3;
+  while (failures.length && failures[0] < cutoff) failures.shift();
+  return failures.length >= MAX_FAILURES;
+}
+
+// Only redirect back into /switch after logging in.
+const safeNext = (next) => (typeof next === 'string' && (next === SWITCH_PATH || next.startsWith(SWITCH_PATH + '/') || next.startsWith(SWITCH_PATH + '?')) ? next : SWITCH_PATH);
+
+function renderLogin(res, status, next, msg) {
+  res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+  res.end(page('Log in', `
+<h1>Switch server</h1>
+<p>Password required.</p>
+${msg ? `<p class="msg">${esc(msg)}</p>` : ''}
+<form class="custom" method="post" action="${SWITCH_PATH}/login">
+  <input type="hidden" name="next" value="${esc(next)}">
+  <input type="password" name="password" autocomplete="current-password" placeholder="password" autofocus required>
+  <button>Log in</button>
+</form>`));
+}
+
+function readBody(req, limit = 4096) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (c) => { body += c; if (body.length > limit) { reject(new Error('body too large')); req.destroy(); } });
+    req.on('end', () => resolve(body));
+    req.on('error', reject);
+  });
+}
+
+async function doLogin(req, res) {
+  let form;
+  try { form = new URLSearchParams(await readBody(req)); } catch { return; }
+  const next = safeNext(form.get('next'));
+  if (tooManyFailures()) return renderLogin(res, 429, next, 'Too many failed attempts. Try again in a few minutes.');
+  if (!safeEqual(form.get('password') || '', PASSWORD)) {
+    failures.push(Date.now());
+    console.log(`[auth] failed login from ${req.headers['x-forwarded-for'] || req.socket.remoteAddress}`);
+    await new Promise((r) => setTimeout(r, 1000));
+    return renderLogin(res, 401, next, 'Wrong password.');
+  }
+  res.writeHead(303, { location: next, 'set-cookie': authCookie(req, COOKIE_MAX_AGE), 'cache-control': 'no-store' });
+  res.end();
+}
+
+// Handles login/logout and rejects unauthenticated requests. Returns true if it responded.
+async function guard(req, res, path) {
+  if (!PASSWORD) {
+    res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+    res.end('The switch page is locked: set SWITCH_PASSWORD in .env next to switch.js, then restart the proxy.\n');
+    return true;
+  }
+  if (path === `${SWITCH_PATH}/login`) {
+    if (req.method === 'POST') await doLogin(req, res);
+    else renderLogin(res, 200, safeNext(new URLSearchParams(req.url.split('?')[1] || '').get('next')));
+    return true;
+  }
+  if (path === `${SWITCH_PATH}/logout`) {
+    res.writeHead(303, { location: SWITCH_PATH, 'set-cookie': authCookie(req, 0), 'cache-control': 'no-store' });
+    res.end();
+    return true;
+  }
+  if (isAuthed(req)) return false;
+  // Browsers get the login form (then come back here); scripts get a plain 401.
+  if (req.method === 'GET' && /text\/html/.test(req.headers.accept || '')) renderLogin(res, 401, safeNext(req.url));
+  else { res.writeHead(401, { 'content-type': 'text/plain' }); res.end('unauthorized\n'); }
+  return true;
+}
 
 // ---- switch UI -------------------------------------------------------------
 const STYLE = `
@@ -112,7 +224,8 @@ async function renderSwitchPage(res, msg) {
 <h1>Switch server</h1>
 <p>Currently proxying to <b>${esc(nameOf(target))}</b> (:${target})</p>
 ${errors.map((m) => `<p class="msg">${esc(m)}</p>`).join('')}
-${rows}${custom}`, head));
+${rows}${custom}
+<p style="margin-top:24px;font-size:13px"><a href="${SWITCH_PATH}/logout" style="color:inherit">Log out</a></p>`, head));
 }
 
 function doSwitch(port, res) {
@@ -195,23 +308,35 @@ function proxy(req, res) {
   req.pipe(up);
 }
 
-const server = http.createServer((req, res) => {
-  const [path, query = ''] = req.url.split('?');
+async function handleSwitch(req, res, path, query) {
+  if (await guard(req, res, path)) return;
   if (path === SWITCH_PATH || path === SWITCH_PATH + '/') {
     return renderSwitchPage(res, new URLSearchParams(query).get('msg'));
   }
-  if (path.startsWith(SWITCH_PATH + '/')) {
-    const parts = path.slice(SWITCH_PATH.length + 1).split('/').filter(Boolean).map(decodeURIComponent);
-    if (parts.length === 1 && /^\d+$/.test(parts[0])) return doSwitch(Number(parts[0]), res);
-    if (parts.length === 2 && req.method === 'POST' && ['start', 'stop', 'restart'].includes(parts[0])) {
-      req.resume();
-      return doAction(parts[0], parts[1], res);
-    }
-    if (parts.length === 2 && parts[0] === 'log') return showLog(parts[1], res);
-    if (parts.join('/') === 'api/state') {
-      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-      return res.end(JSON.stringify({ target, name: nameOf(target) }));
-    }
+  let parts = [];
+  try { parts = path.slice(SWITCH_PATH.length + 1).split('/').filter(Boolean).map(decodeURIComponent); } catch {}
+  if (parts.length === 1 && /^\d+$/.test(parts[0])) return doSwitch(Number(parts[0]), res);
+  if (parts.length === 2 && req.method === 'POST' && ['start', 'stop', 'restart'].includes(parts[0])) {
+    req.resume();
+    return doAction(parts[0], parts[1], res);
+  }
+  if (parts.length === 2 && parts[0] === 'log') return showLog(parts[1], res);
+  if (parts.join('/') === 'api/state') {
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    return res.end(JSON.stringify({ target, name: nameOf(target) }));
+  }
+  res.writeHead(404, { 'content-type': 'text/plain' });
+  res.end('not found\n');
+}
+
+const server = http.createServer((req, res) => {
+  const [path, query = ''] = req.url.split('?');
+  if (path === SWITCH_PATH || path.startsWith(SWITCH_PATH + '/')) {
+    return handleSwitch(req, res, path, query).catch((err) => {
+      console.error('[switch]', err);
+      if (!res.headersSent) res.writeHead(500);
+      res.end();
+    });
   }
   proxy(req, res);
 });

@@ -14,8 +14,21 @@ const { spawn, execFileSync } = require('child_process');
 const ROOT = __dirname;
 const CONFIG_FILE = path.join(ROOT, 'servers.json');
 const RUN_DIR = path.join(ROOT, 'run');
+const ENV_FILE = path.join(ROOT, '.env');
 const PROXY = 'proxy'; // the proxy itself (switch.js); --self is an alias
 const RESERVED = new Set([PROXY, 'self', 'all']);
+
+// .env next to this file (KEY=value lines, # comments); real environment variables win.
+// Keys from it are kept out of the servers' environments (only the proxy gets them).
+const ENV_KEYS = new Set(['SWITCH_PASSWORD']);
+try {
+  for (const line of fs.readFileSync(ENV_FILE, 'utf8').split(/\r?\n/)) {
+    const m = /^\s*(?:export\s+)?([A-Za-z_]\w*)\s*=\s*(.*?)\s*$/.exec(line);
+    if (!m) continue;
+    ENV_KEYS.add(m[1]);
+    process.env[m[1]] ??= m[2].replace(/^(['"])(.*)\1$/, '$2');
+  }
+} catch {}
 
 // ---- help ------------------------------------------------------------------
 const HELP = {
@@ -37,6 +50,7 @@ Commands that take names show a picker when no name is given.
 "${PROXY}" is the proxy itself (switch.js); --self is an alias. --all never includes it.
 
 files: ${CONFIG_FILE}
+       ${ENV_FILE}  (SWITCH_PASSWORD for the /switch page)
        ${RUN_DIR}${path.sep}<name>.pid, <name>.log`,
 
   status: `usage: portctl status [name...]
@@ -190,7 +204,8 @@ function tail(name, lines = 40) {
 // GET a path on the running proxy -> { status, body }
 function proxyRequest(config, urlPath) {
   return new Promise((resolve, reject) => {
-    const req = http.get({ host: '127.0.0.1', port: config.proxy.port, path: urlPath, timeout: 1500 }, (res) => {
+    const headers = process.env.SWITCH_PASSWORD ? { authorization: `Bearer ${process.env.SWITCH_PASSWORD}` } : {};
+    const req = http.get({ host: '127.0.0.1', port: config.proxy.port, path: urlPath, headers, timeout: 1500 }, (res) => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (c) => { body += c; });
@@ -231,6 +246,7 @@ async function start(entry) {
     stdio: ['ignore', log, log],
     env: { ...process.env, ...entry.env, PORT: String(entry.port) },
   };
+  if (entry.name !== PROXY) for (const k of ENV_KEYS) delete opts.env[k];
   // On Windows a detached (console-less) cmd.exe doesn't pass the log handles on to the
   // programs it runs, so detach a small node wrapper and let it run the shell normally.
   const child = process.platform === 'win32'
@@ -369,6 +385,8 @@ async function cliSwitch(config, port, label) {
   } catch {
     throw new Error(`the proxy isn't answering on :${config.proxy.port} (portctl start ${PROXY})`);
   }
+  if (res.status === 401) throw new Error(`proxy rejected the password: check SWITCH_PASSWORD in ${ENV_FILE} (restart the proxy after changing it)`);
+  if (res.status === 503) throw new Error(`the proxy has no SWITCH_PASSWORD: set it in ${ENV_FILE} and run portctl restart ${PROXY}`);
   if (res.status !== 302) throw new Error(`proxy refused: ${res.body.trim()}`);
   console.log(`proxy -> ${label} (:${port})`);
 }

@@ -3,3 +3,4 @@ node_modules/
 .idea/
 servers.json
 .r2-sync.json
+.env
