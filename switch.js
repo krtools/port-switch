@@ -15,7 +15,7 @@
 // for a long-lived cookie, or send "Authorization: Bearer <password>" (portctl does).
 //
 // Usage: node switch.js   or   portctl start proxy
-// env: PORT HOST TARGET SWITCH_PASSWORD SWITCH_COOKIE_DAYS (default 365)
+// env: PORT HOST TARGET SWITCH_PASSWORD SWITCH_COOKIE_DAYS (default 365) SWITCH_COOKIE_DOMAIN
 
 const http = require('http');
 const net = require('net');
@@ -57,6 +57,12 @@ const nameOf = (port) => entryOf(port)?.name || `port ${port}`;
 const PASSWORD = process.env.SWITCH_PASSWORD || '';
 const COOKIE = 'port_switch_auth';
 const COOKIE_MAX_AGE = (Number(process.env.SWITCH_COOKIE_DAYS) || 365) * 86400;
+// Unset = host-only (just the exact host). A domain also covers all its subdomains.
+const COOKIE_DOMAIN = process.env.SWITCH_COOKIE_DOMAIN || '';
+if (COOKIE_DOMAIN && !/^\.?[a-z0-9-]+(\.[a-z0-9-]+)*$/i.test(COOKIE_DOMAIN)) {
+  console.error(`[port-switch] bad SWITCH_COOKIE_DOMAIN: ${COOKIE_DOMAIN}`);
+  process.exit(1);
+}
 const MAX_FAILURES = 20; // per 15 minutes, across all clients
 const failures = [];
 
@@ -83,7 +89,8 @@ function isAuthed(req) {
 function authCookie(req, maxAge) {
   const exp = Math.floor(Date.now() / 1000) + maxAge;
   const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
-  return `${COOKIE}=${maxAge ? `${exp}.${sign(exp)}` : ''}; Path=${SWITCH_PATH}; Max-Age=${maxAge}; HttpOnly; SameSite=Lax${secure}`;
+  const domain = COOKIE_DOMAIN ? `; Domain=${COOKIE_DOMAIN}` : '';
+  return `${COOKIE}=${maxAge ? `${exp}.${sign(exp)}` : ''}; Path=${SWITCH_PATH}; Max-Age=${maxAge}; HttpOnly; SameSite=Lax${domain}${secure}`;
 }
 
 function tooManyFailures() {
