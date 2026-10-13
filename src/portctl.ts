@@ -13,10 +13,22 @@ import { spawn, execFileSync, type SpawnOptions } from 'child_process';
 import { StringDecoder } from 'string_decoder';
 import { sleep, errCode, errMsg } from './util';
 
-const ROOT = __dirname;
-const CONFIG_FILE = path.join(ROOT, 'servers.json');
-const RUN_DIR = path.join(ROOT, 'run');
-const ENV_FILE = path.join(ROOT, '.env');
+const CODE_DIR = __dirname;
+
+// servers.json: --config <file> (portctl or switch.js), else $PORT_SWITCH_CONFIG, else next
+// to the code. Everything else lives beside it: .env, run/, and relative "cwd" paths.
+function configFromArgs(argv: string[]): string | undefined {
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--config') return argv[i + 1];
+    if (argv[i].startsWith('--config=')) return argv[i].slice('--config='.length);
+  }
+  return undefined;
+}
+const configArg = configFromArgs(process.argv.slice(2));
+export const CONFIG_FILE = path.resolve(configArg || process.env.PORT_SWITCH_CONFIG || path.join(CODE_DIR, 'servers.json'));
+const HOME_DIR = path.dirname(CONFIG_FILE);
+const RUN_DIR = path.join(HOME_DIR, 'run');
+const ENV_FILE = path.join(HOME_DIR, '.env');
 export const PROXY = 'proxy'; // the proxy itself (switch.js); --self is an alias
 const RESERVED = new Set([PROXY, 'self', 'all']);
 
@@ -74,6 +86,9 @@ commands:
   help    [command]               help for a command (or: portctl <command> --help)
 
 Commands that take names show a picker when no name is given.
+
+--config FILE (anywhere on the line), or PORT_SWITCH_CONFIG=FILE: use that servers.json.
+.env, run/ and relative "cwd" paths are then taken from FILE's folder as well.
 
 servers.json entries: name, port, cmd, and optionally cwd, env, color.
 "color": true sets FORCE_COLOR=1 and CLICOLOR_FORCE=1 so tools keep their colors
@@ -149,7 +164,13 @@ const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'obj
 const isPort = (v: unknown): v is number => Number.isInteger(v) && (v as number) >= 1 && (v as number) <= 65535;
 
 export function loadConfig(): Config {
-  const raw: unknown = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  let text: string;
+  try { text = fs.readFileSync(CONFIG_FILE, 'utf8'); } catch (err) {
+    if (errCode(err) !== 'ENOENT') throw err;
+    throw new Error(`no config at ${CONFIG_FILE} (copy servers.example.json there, or point --config / PORT_SWITCH_CONFIG at one)`);
+  }
+  let raw: unknown;
+  try { raw = JSON.parse(text); } catch (err) { throw new Error(`${CONFIG_FILE}: ${errMsg(err)}`); }
   if (!isObject(raw)) throw new Error('servers.json: must be a JSON object');
   if (raw.proxy !== undefined && !isObject(raw.proxy)) throw new Error('servers.json: "proxy" must be an object');
   if (raw.logs !== undefined && !isObject(raw.logs)) throw new Error('servers.json: "logs" must be an object');
@@ -192,7 +213,8 @@ export function loadConfig(): Config {
 }
 
 function proxyEntry(config: Config): ServerEntry {
-  return { name: PROXY, port: config.proxy.port, cwd: ROOT, cmd: `${JSON.stringify(process.execPath)} switch.js` };
+  const script = path.join(CODE_DIR, 'switch.js');
+  return { name: PROXY, port: config.proxy.port, cwd: HOME_DIR, cmd: `${JSON.stringify(process.execPath)} ${JSON.stringify(script)}` };
 }
 
 export function findEntry(config: Config, name: string): ServerEntry | undefined {
@@ -211,7 +233,7 @@ function resolveNames(config: Config, names: string[]): ServerEntry[] {
 // ---- process state ---------------------------------------------------------
 const pidFile = (name: string) => path.join(RUN_DIR, `${name}.pid`);
 export const logFile = (name: string) => path.join(RUN_DIR, `${name}.log`);
-const resolveCwd = (entry: ServerEntry) => path.resolve(ROOT, (entry.cwd || '.').replace(/^~(?=$|[\\/])/, os.homedir()));
+const resolveCwd = (entry: ServerEntry) => path.resolve(HOME_DIR, (entry.cwd || '.').replace(/^~(?=$|[\\/])/, os.homedir()));
 
 function isAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch (e) { return errCode(e) === 'EPERM'; }
@@ -299,7 +321,8 @@ export async function start(entry: ServerEntry): Promise<number> {
   fs.writeFileSync(logFile(entry.name), `# ${new Date().toISOString()}  (cwd ${cwd})\n$ ${entry.cmd}\n`);
   const log = fs.openSync(logFile(entry.name), 'a');
   const env: NodeJS.ProcessEnv = { ...process.env, ...(entry.color && COLOR_ENV), ...entry.env, PORT: String(entry.port) };
-  if (entry.name !== PROXY) for (const k of ENV_KEYS) delete env[k];
+  if (entry.name === PROXY) env.PORT_SWITCH_CONFIG = CONFIG_FILE; // the proxy uses the same config
+  else for (const k of [...ENV_KEYS, 'PORT_SWITCH_CONFIG']) delete env[k];
   const opts: SpawnOptions = {
     cwd,
     detached: true, // own process group, survives this process / the SSH session
@@ -548,7 +571,20 @@ function parseArgs(argv: string[]): Options {
   return opts;
 }
 
+/** argv without --config <file> / --config=<file> (already applied at startup). */
+function withoutConfig(argv: string[]): string[] {
+  const rest: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--config') {
+      if (argv[i + 1] === undefined) throw new Error('--config needs a file');
+      i++;
+    } else if (!argv[i].startsWith('--config=')) rest.push(argv[i]);
+  }
+  return rest;
+}
+
 async function main(argv: string[]): Promise<void> {
+  argv = withoutConfig(argv);
   const cmd = argv[0] && !argv[0].startsWith('-') ? (argv.shift() as string) : null;
   if (cmd === 'help') {
     if (argv[0] && !HELP[argv[0]]) throw new Error(`no help for "${argv[0]}" (commands: ${COMMANDS.join(', ')})`);

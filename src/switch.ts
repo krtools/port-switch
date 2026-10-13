@@ -15,8 +15,8 @@
 // Everything under /switch needs SWITCH_PASSWORD (from .env): log in once in the browser
 // for a long-lived cookie, or send "Authorization: Bearer <password>" (portctl does).
 //
-// Usage: node switch.js   or   portctl start proxy
-// env: PORT HOST TARGET SWITCH_PASSWORD SWITCH_COOKIE_DAYS (default 365) SWITCH_COOKIE_DOMAIN
+// Usage: node switch.js [--config servers.json]   or   portctl start proxy
+// env: PORT_SWITCH_CONFIG PORT HOST TARGET SWITCH_PASSWORD SWITCH_COOKIE_DAYS (default 365) SWITCH_COOKIE_DOMAIN
 
 import * as http from 'http';
 import * as net from 'net';
@@ -174,7 +174,7 @@ async function doLogin(req: Req, res: Res): Promise<void> {
 async function guard(req: Req, res: Res, urlPath: string): Promise<boolean> {
   if (!PASSWORD) {
     res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
-    res.end('The switch page is locked: set SWITCH_PASSWORD in .env next to switch.js, then restart the proxy.\n');
+    res.end('The switch page is locked: set SWITCH_PASSWORD in the .env next to servers.json, then restart the proxy.\n');
     return true;
   }
   if (urlPath === `${SWITCH_PATH}/login`) {
