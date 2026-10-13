@@ -22,6 +22,22 @@ const net = require('net');
 const crypto = require('crypto');
 const launcher = require('./portctl');
 
+// Timestamp every log line, and record why the process ends: the log (run/proxy.log
+// under portctl) is the only trace. If it ends with none of these lines, the process
+// got SIGKILL (e.g. the kernel OOM killer) or the log was cleared by a restart.
+for (const level of ['log', 'error']) {
+  const write = console[level].bind(console);
+  console[level] = (...args) => write(new Date().toISOString(), ...args);
+}
+process.on('uncaughtException', (err, origin) => { // also unhandled rejections
+  console.error(`[fatal] ${origin}:`, err);
+  process.exit(1);
+});
+for (const [sig, num] of [['SIGTERM', 15], ['SIGINT', 2], ['SIGHUP', 1]]) {
+  process.on(sig, () => { console.log(`[exit] received ${sig}`); process.exit(128 + num); });
+}
+process.on('exit', (code) => console.log(`[exit] code ${code}`));
+
 const UPSTREAM_HOST = '127.0.0.1';
 const ALLOW_UNREGISTERED = true; // allow /switch/{port} for ports not in servers.json
 
