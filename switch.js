@@ -290,7 +290,8 @@ async function doAction(action, name, res) {
 }
 
 // ---- logs ------------------------------------------------------------------
-//   GET /switch/log/{name}          viewer page (?raw or a non-browser client: plain text)
+//   GET /switch/log/{name}          viewer page (?raw or a non-browser client: plain text);
+//                                   ?lines=N history to load (default 1000, max 5000)
 //   GET /switch/log/{name}/stream   SSE: the last ?lines=N lines, then new output live
 //   GET /switch/logs[/stream]       the same for every server (plus the proxy), combined
 // Each SSE message is {n: name, t: text}; its id holds every file's read position so a
@@ -298,6 +299,8 @@ async function doAction(action, name, res) {
 // means the log was started over (server restarted).
 
 const logNames = () => [...config.servers.filter((s) => s.cmd).map((s) => s.name), launcher.PROXY];
+const LOG_LINES = 1000; // default history for one server's log (the combined view: 50 per server)
+const linesParam = (query) => (new URLSearchParams(query).has('lines') ? `?lines=${clampLines(query, 0)}` : '');
 const clampLines = (query, dflt) => Math.min(5000, Math.max(0, Number(new URLSearchParams(query).get('lines') ?? dflt) || 0));
 
 function fileSize(file) {
@@ -322,11 +325,11 @@ function logSignature(file) {
   return crypto.createHash('sha1').update(nl === -1 ? head : head.subarray(0, nl)).digest('hex').slice(0, 8);
 }
 
-// Byte offset where the last `lines` lines start (looking back at most 256KB).
+// Byte offset where the last `lines` lines start (looking back at most 1MB).
 function tailOffset(file, lines) {
   const size = fileSize(file);
   if (!lines) return size;
-  const from = Math.max(0, size - 256 * 1024);
+  const from = Math.max(0, size - 1024 * 1024);
   let buf;
   try { buf = readRange(file, from, size); } catch { return size; }
   let i = buf.length - (buf[buf.length - 1] === 10 ? 1 : 0);
@@ -406,7 +409,7 @@ function streamLogs(req, res, names, lines) {
 
 function showLogText(res, name, query) {
   res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
-  res.end(launcher.tail(name, clampLines(query, 200)) || '(no log yet)\n');
+  res.end(launcher.tail(name, clampLines(query, LOG_LINES)) || '(no log yet)\n');
 }
 
 const LOG_STYLE = `
@@ -699,17 +702,17 @@ async function handleSwitch(req, res, path, query) {
   if (parts[0] === 'log' && parts.length <= 3 && req.method === 'GET') {
     const name = parts[1];
     if (!logNames().includes(name)) { res.writeHead(404, { 'content-type': 'text/plain' }); return res.end('unknown server\n'); }
-    if (parts[2] === 'stream') return streamLogs(req, res, [name], clampLines(query, 200));
+    if (parts[2] === 'stream') return streamLogs(req, res, [name], clampLines(query, LOG_LINES));
     if (parts.length === 3) { res.writeHead(404); return res.end(); }
     const browser = /text\/html/.test(req.headers.accept || '');
     if (!browser || new URLSearchParams(query).has('raw')) return showLogText(res, name, query);
     const base = `${SWITCH_PATH}/log/${encodeURIComponent(name)}`;
-    return renderLogViewer(res, { title: `${name} log`, streamUrl: `${base}/stream`, combined: false, names: [name] });
+    return renderLogViewer(res, { title: `${name} log`, streamUrl: `${base}/stream${linesParam(query)}`, combined: false, names: [name] });
   }
   if (parts[0] === 'logs' && req.method === 'GET') {
     const names = logNames();
     if (parts[1] === 'stream' && parts.length === 2) return streamLogs(req, res, names, clampLines(query, 50));
-    if (parts.length === 1) return renderLogViewer(res, { title: 'All logs', streamUrl: `${SWITCH_PATH}/logs/stream`, combined: true, names });
+    if (parts.length === 1) return renderLogViewer(res, { title: 'All logs', streamUrl: `${SWITCH_PATH}/logs/stream${linesParam(query)}`, combined: true, names });
   }
   if (parts.join('/') === 'api/state') {
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
