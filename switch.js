@@ -320,9 +320,13 @@ function readRange(file, start, end) {
 
 // A log's first line (portctl writes a timestamp there), hashed: when it changes, the file
 // was rewritten by a restart even if it has already grown past our read position.
+// null if the file doesn't exist; throws if it exists but can't be read.
 function logSignature(file) {
   let head;
-  try { head = readRange(file, 0, 256); } catch { return '-'; }
+  try { head = readRange(file, 0, 256); } catch (err) {
+    if (err.code === 'ENOENT') return null; // not there (yet), e.g. mid-restart
+    throw err; // there but unreadable: the caller reports it
+  }
   const nl = head.indexOf(10);
   return crypto.createHash('sha1').update(nl === -1 ? head : head.subarray(0, nl)).digest('hex').slice(0, 8);
 }
@@ -387,19 +391,43 @@ function parseLastEventId(header) {
   return resume;
 }
 
+const MAX_STREAMS = 64; // open log streams; past this the oldest is closed (its viewer reconnects)
+const MAX_BUFFERED = 8 * 1024 * 1024; // a client this far behind is dropped; it resumes on reconnect
+const openStreams = new Set();
+
 function streamLogs(req, res, names, lines) {
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-store, no-transform',
     'x-accel-buffering': 'no', // nginx: don't buffer the stream
   });
-  res.on('error', () => {});
+  // Notice clients that vanish without closing the connection (sleep, network drop).
+  req.socket.setKeepAlive(true, 30000);
+  req.socket.setNoDelay(true);
+
+  let closed = false;
+  let unwatch = [];
+  let ping;
+  const close = (why) => {
+    if (closed) return;
+    closed = true;
+    clearInterval(ping);
+    unwatch.forEach((fn) => fn());
+    openStreams.delete(close);
+    if (why) console.log(`[logs] closed a stream (${names.join(', ')}): ${why}`);
+    res.destroy();
+  };
+  res.on('close', () => close());
+  res.on('error', (err) => close(err.code || err.message));
+  openStreams.add(close);
+  if (openStreams.size > MAX_STREAMS) openStreams.values().next().value('too many open log streams');
   res.write('retry: 2000\n\n');
 
   const resume = parseLastEventId(req.headers['last-event-id']);
   const streams = names.map((name) => {
     const file = launcher.logFile(name);
-    const sig = logSignature(file);
+    let sig = null;
+    try { sig = logSignature(file); } catch {}
     const prev = resume[name];
     if (prev && prev.sig === sig && prev.offset <= fileSize(file)) {
       return { name, file, sig, offset: prev.offset, older: [], decoder: new StringDecoder('utf8') };
@@ -409,23 +437,44 @@ function streamLogs(req, res, names, lines) {
     return { name, file, sig, offset: current.start, older: parts, decoder: new StringDecoder('utf8') };
   });
   const id = () => streams.map((s) => `${s.name}=${s.offset}.${s.sig}`).join(';');
-  const send = (event, data) => res.write(`${event ? `event: ${event}\n` : ''}id: ${id()}\ndata: ${JSON.stringify(data)}\n\n`);
+  const send = (event, data) => {
+    if (closed) return;
+    res.write(`${event ? `event: ${event}\n` : ''}id: ${id()}\ndata: ${JSON.stringify(data)}\n\n`);
+    if (res.writableLength > MAX_BUFFERED) close('client too slow');
+  };
+
+  // Tell the viewer once when a log can't be read (e.g. permissions), and again when it can.
+  const readError = (s, err) => {
+    const msg = err ? `can't read ${path.basename(s.file)}: ${err.code || err.message}` : '';
+    if (msg === (s.error || '')) return;
+    s.error = msg;
+    send('notice', { n: s.name, text: msg || `${path.basename(s.file)} is readable again` });
+  };
 
   const pump = (s) => {
-    const sig = logSignature(s.file);
-    const size = fileSize(s.file);
-    if (sig !== s.sig || size < s.offset) {
-      Object.assign(s, { sig, offset: 0, decoder: new StringDecoder('utf8') });
-      send('reset', { n: s.name });
-    }
-    while (s.offset < size) {
-      const end = Math.min(size, s.offset + 256 * 1024);
-      let chunk;
-      try { chunk = readRange(s.file, s.offset, end); } catch { return; }
-      s.offset += chunk.length;
-      const text = s.decoder.write(chunk); // holds back a multi-byte character cut in half
-      if (text) send('', { n: s.name, t: text });
-      if (!chunk.length) return;
+    if (closed) return;
+    try {
+      let sig;
+      try { sig = logSignature(s.file); } catch (err) { return readError(s, err); }
+      if (sig === null) return; // gone for the moment (a restart renames it, then writes the new one)
+      if (s.error) readError(s, null);
+      const size = fileSize(s.file);
+      if (sig !== s.sig || size < s.offset) {
+        Object.assign(s, { sig, offset: 0, decoder: new StringDecoder('utf8') });
+        send('reset', { n: s.name });
+      }
+      while (s.offset < size && !closed) {
+        const end = Math.min(size, s.offset + 256 * 1024);
+        let chunk;
+        try { chunk = readRange(s.file, s.offset, end); } catch (err) { return readError(s, err); }
+        s.offset += chunk.length;
+        const text = s.decoder.write(chunk); // holds back a multi-byte character cut in half
+        if (text) send('', { n: s.name, t: text });
+        if (!chunk.length) return;
+      }
+    } catch (err) {
+      console.error(`[logs] ${s.name}:`, err);
+      close('error');
     }
   };
 
@@ -437,7 +486,10 @@ function streamLogs(req, res, names, lines) {
       const decoder = new StringDecoder('utf8');
       for (let pos = part.start; pos < part.end;) {
         let chunk;
-        try { chunk = readRange(part.file, pos, Math.min(part.end, pos + 256 * 1024)); } catch { break; }
+        try { chunk = readRange(part.file, pos, Math.min(part.end, pos + 256 * 1024)); } catch (err) {
+          send('notice', { n: s.name, text: `can't read ${path.basename(part.file)}: ${err.code || err.message}` });
+          break;
+        }
         if (!chunk.length) break;
         pos += chunk.length;
         const text = decoder.write(chunk);
@@ -446,10 +498,15 @@ function streamLogs(req, res, names, lines) {
     }
     send('run', { n: s.name, label: 'current run' });
   };
-  streams.forEach((s) => { sendOlder(s); pump(s); });
-  const unwatch = streams.map((s) => watchLog(s.file, () => pump(s)));
-  const ping = setInterval(() => res.write(': ping\n\n'), 20000); // keeps idle proxies from dropping it
-  req.on('close', () => { clearInterval(ping); unwatch.forEach((fn) => fn()); });
+  try {
+    streams.forEach((s) => { sendOlder(s); pump(s); });
+  } catch (err) {
+    console.error('[logs] sending history:', err);
+    return close('error');
+  }
+  if (closed) return;
+  unwatch = streams.map((s) => watchLog(s.file, () => pump(s)));
+  ping = setInterval(() => { if (!closed) res.write(': ping\n\n'); }, 20000); // keeps idle proxies from dropping it
 }
 
 function showLogText(res, name, query) {
@@ -637,7 +694,9 @@ function logClient(opts) {
   }
 
   function handle(ev) {
-    if (ev.type === 'reset' || ev.type === 'run') {
+    if (ev.type === 'notice') {
+      sysLine(`— ${ev.data.n}: ${ev.data.text} —`);
+    } else if (ev.type === 'reset' || ev.type === 'run') {
       const name = ev.data.n;
       delete streams[name]; // colors don't carry over between runs
       sysLine(ev.type === 'reset' ? `— ${name}: server restarted —` : `— ${name}: ${ev.data.label} —`);
@@ -669,6 +728,7 @@ function logClient(opts) {
   source.onmessage = (e) => receive('message', e);
   source.addEventListener('reset', (e) => receive('reset', e));
   source.addEventListener('run', (e) => receive('run', e));
+  source.addEventListener('notice', (e) => receive('notice', e));
   source.onopen = () => setConn('live', 'live');
   source.onerror = () => {
     if (source.readyState === EventSource.CLOSED) setConn('dead', 'disconnected (reload, or log in again)');
@@ -714,7 +774,9 @@ function upstreamHeaders(req, port) {
 function badGateway(res, port, err) {
   if (res.headersSent) return res.destroy();
   const entry = entryOf(port);
-  const startBtn = entry?.cmd && !launcher.getPid(entry.name)
+  let running = true;
+  try { running = !!launcher.getPid(entry?.name); } catch {}
+  const startBtn = entry?.cmd && !running
     ? `<form method="post" action="${SWITCH_PATH}/start/${encodeURIComponent(entry.name)}"><button>Start ${esc(entry.name)}</button></form>` : '';
   res.writeHead(502, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
   res.end(page('502', `
@@ -723,7 +785,9 @@ function badGateway(res, port, err) {
 <p><a href="${SWITCH_PATH}">Switch server &rarr;</a></p>`));
 }
 
-function proxy(req, res) {
+const hasBody = (req) => !!req.headers['transfer-encoding'] || Number(req.headers['content-length']) > 0;
+
+function proxy(req, res, retry = true) {
   const port = target;
   const up = http.request({
     host: UPSTREAM_HOST, port, method: req.method, path: req.url,
@@ -733,10 +797,24 @@ function proxy(req, res) {
     if (headers.location) headers.location = fixLocation(headers.location);
     res.writeHead(pres.statusCode, pres.statusMessage, headers);
     pres.pipe(res);
+    // The server went away mid-response: end the client's response too instead of leaving it hanging.
+    pres.on('aborted', () => res.destroy());
+    pres.on('error', () => res.destroy());
   });
-  up.on('error', (err) => badGateway(res, port, err));
-  req.on('aborted', () => up.destroy());
-  req.pipe(up);
+  up.on('error', (err) => {
+    // A reused keep-alive connection that the server closed just as we sent on it. Nothing
+    // reached the server, so a request without a body is safe to send again.
+    if (retry && up.reusedSocket && ['ECONNRESET', 'EPIPE'].includes(err.code) && !res.headersSent && !hasBody(req)) {
+      return proxy(req, res, false);
+    }
+    if (res.destroyed) return; // the client already left; nothing to report to
+    console.log(`[proxy] ${req.method} ${req.url} -> :${port}: ${err.code || err.message}${res.headersSent ? ' (mid-response)' : ''}`);
+    badGateway(res, port, err);
+  });
+  // The client went away first: drop the upstream request.
+  res.on('close', () => { if (!res.writableFinished) up.destroy(); });
+  if (hasBody(req)) req.pipe(up);
+  else { req.resume(); up.end(); }
 }
 
 async function handleSwitch(req, res, path, query) {
@@ -768,7 +846,7 @@ async function handleSwitch(req, res, path, query) {
   }
   if (parts.join('/') === 'api/state') {
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-    return res.end(JSON.stringify({ target, name: nameOf(target) }));
+    return res.end(JSON.stringify({ target, name: nameOf(target), logStreams: openStreams.size, websockets: tunnels.size }));
   }
   res.writeHead(404, { 'content-type': 'text/plain' });
   res.end('not found\n');
@@ -789,7 +867,10 @@ const server = http.createServer((req, res) => {
 // WebSocket / any Upgrade: raw TCP tunnel to the active target.
 server.on('upgrade', (req, socket, head) => {
   const port = target;
+  let connected = false;
   const up = net.connect(port, UPSTREAM_HOST, () => {
+    connected = true;
+    up.setTimeout(0);
     const headers = upstreamHeaders(req, port);
     let raw = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`;
     for (const [k, v] of Object.entries(headers)) {
@@ -799,10 +880,33 @@ server.on('upgrade', (req, socket, head) => {
     if (head?.length) up.write(head);
     socket.pipe(up).pipe(socket);
   });
+  // Small messages (HMR updates) go out at once; dead peers on either side get noticed.
+  for (const s of [socket, up]) { s.setNoDelay(true); s.setKeepAlive(true, 30000); }
+  up.setTimeout(5000, () => up.destroy(new Error('connect timeout')));
   const close = () => { up.destroy(); socket.destroy(); tunnels.delete(socket); };
   tunnels.add(socket);
-  up.on('error', close); up.on('close', close);
-  socket.on('error', close); socket.on('close', close);
+  up.on('error', (err) => {
+    if (!connected) {
+      console.log(`[proxy] websocket ${req.url} -> :${port}: ${err.code || err.message}`);
+      if (socket.writable) socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    }
+    close();
+  });
+  up.on('close', close);
+  socket.on('error', close);
+  socket.on('close', close);
+});
+
+// Keep idle client connections open longer than the outer proxy does (nginx 60s, Traefik
+// 90s, Cloudflare 90s, ...). If we closed first, it could send a request on a connection
+// just as we close it, and that request fails with a brief 502.
+server.keepAliveTimeout = 150 * 1000;
+server.headersTimeout = 155 * 1000; // must exceed keepAliveTimeout on older Node
+
+// Malformed requests and clients that drop mid-request: answer if possible, never throw.
+server.on('clientError', (err, socket) => {
+  if (err.code !== 'ECONNRESET' && socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+  else socket.destroy();
 });
 
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {

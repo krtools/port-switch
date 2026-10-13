@@ -173,7 +173,7 @@ function getPid(name) {
   let pid;
   try { pid = Number(fs.readFileSync(pidFile(name), 'utf8')); } catch { return null; }
   if (pid > 0 && isAlive(pid)) return pid;
-  fs.rmSync(pidFile(name), { force: true });
+  try { fs.rmSync(pidFile(name), { force: true }); } catch {} // e.g. no permission; harmless, retried next time
   return null;
 }
 
@@ -306,7 +306,7 @@ async function stop(entry) {
   killTree(pid, false);
   for (let i = 0; i < 30 && groupAlive(pid); i++) await sleep(100);
   if (groupAlive(pid)) killTree(pid, true);
-  fs.rmSync(pidFile(entry.name), { force: true });
+  try { fs.rmSync(pidFile(entry.name), { force: true }); } catch {}
   return true;
 }
 
