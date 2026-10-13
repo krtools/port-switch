@@ -8,7 +8,7 @@
     "node": ">=16"
   },
   "scripts": {
-    "build": "tsc -p . && node -e \"for (const f of ['servers.example.json', '.env.example']) require('fs').copyFileSync(f, 'dist/' + f)\"",
+    "build": "tsc -p . && node -e \"for (const f of ['servers.example.json', '.env.example', 'README.md']) require('fs').copyFileSync(f, 'dist/' + f)\"",
     "typecheck": "tsc -p . --noEmit",
     "watch": "tsc -p . --watch",
     "portctl": "node dist/portctl.js",
