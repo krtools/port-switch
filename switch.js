@@ -22,6 +22,7 @@ const http = require('http');
 const net = require('net');
 const crypto = require('crypto');
 const fs = require('fs');
+const path = require('path');
 const { StringDecoder } = require('string_decoder');
 const launcher = require('./portctl');
 
@@ -296,7 +297,8 @@ async function doAction(action, name, res) {
 //   GET /switch/logs[/stream]       the same for every server (plus the proxy), combined
 // Each SSE message is {n: name, t: text}; its id holds every file's read position so a
 // reconnect (EventSource sends Last-Event-ID) resumes where it left off. A "reset" event
-// means the log was started over (server restarted).
+// means the log was started over (server restarted). History reaches back into previous
+// runs' logs (<name>.log.1, ...), each preceded by a "run" event that labels it.
 
 const logNames = () => [...config.servers.filter((s) => s.cmd).map((s) => s.name), launcher.PROXY];
 const LOG_LINES = 1000; // default history for one server's log (the combined view: 50 per server)
@@ -325,17 +327,39 @@ function logSignature(file) {
   return crypto.createHash('sha1').update(nl === -1 ? head : head.subarray(0, nl)).digest('hex').slice(0, 8);
 }
 
-// Byte offset where the last `lines` lines start (looking back at most 1MB).
+// Where the last `lines` lines of a file start (looking back at most 1MB), and how many
+// lines that actually is (fewer if the file is shorter).
 function tailOffset(file, lines) {
   const size = fileSize(file);
-  if (!lines) return size;
+  if (!lines) return { offset: size, count: 0 };
   const from = Math.max(0, size - 1024 * 1024);
   let buf;
-  try { buf = readRange(file, from, size); } catch { return size; }
+  try { buf = readRange(file, from, size); } catch { return { offset: size, count: 0 }; }
   let i = buf.length - (buf[buf.length - 1] === 10 ? 1 : 0);
   for (let count = 0; i > 0; i--) if (buf[i - 1] === 10 && ++count === lines) break;
   if (i === 0 && from > 0) i = buf.indexOf(10) + 1; // don't start mid-line
-  return from + i;
+  const picked = buf.subarray(i);
+  let count = 0;
+  for (const b of picked) if (b === 10) count++;
+  if (picked.length && picked[picked.length - 1] !== 10) count++;
+  return { offset: from + i, count };
+}
+
+// The last `lines` lines of a server's log, reaching back into previous runs
+// (<name>.log.1, .2, ... kept by portctl) when the current run is shorter.
+// Oldest first; the last part is always the current log.
+function logHistory(name, lines) {
+  const file = launcher.logFile(name);
+  const parts = [];
+  let need = lines;
+  for (let run = 0; run === 0 || (need > 0 && run <= 100); run++) {
+    const f = run ? `${file}.${run}` : file;
+    if (run && !fs.existsSync(f)) break;
+    const { offset, count } = tailOffset(f, need);
+    parts.unshift({ file: f, label: run ? `previous run (${path.basename(f)})` : 'current run', start: offset, end: fileSize(f) });
+    need -= count;
+  }
+  return parts;
 }
 
 // One fs.watchFile per log, shared by every open stream. (Works before the file exists.)
@@ -377,8 +401,12 @@ function streamLogs(req, res, names, lines) {
     const file = launcher.logFile(name);
     const sig = logSignature(file);
     const prev = resume[name];
-    const offset = prev && prev.sig === sig && prev.offset <= fileSize(file) ? prev.offset : tailOffset(file, lines);
-    return { name, file, sig, offset, decoder: new StringDecoder('utf8') };
+    if (prev && prev.sig === sig && prev.offset <= fileSize(file)) {
+      return { name, file, sig, offset: prev.offset, older: [], decoder: new StringDecoder('utf8') };
+    }
+    const parts = logHistory(name, lines);
+    const current = parts.pop();
+    return { name, file, sig, offset: current.start, older: parts, decoder: new StringDecoder('utf8') };
   });
   const id = () => streams.map((s) => `${s.name}=${s.offset}.${s.sig}`).join(';');
   const send = (event, data) => res.write(`${event ? `event: ${event}\n` : ''}id: ${id()}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -401,15 +429,39 @@ function streamLogs(req, res, names, lines) {
     }
   };
 
-  streams.forEach(pump);
+  // History from previous runs first (those files don't change), then the live log.
+  const sendOlder = (s) => {
+    if (!s.older.length) return;
+    for (const part of s.older) {
+      send('run', { n: s.name, label: part.label });
+      const decoder = new StringDecoder('utf8');
+      for (let pos = part.start; pos < part.end;) {
+        let chunk;
+        try { chunk = readRange(part.file, pos, Math.min(part.end, pos + 256 * 1024)); } catch { break; }
+        if (!chunk.length) break;
+        pos += chunk.length;
+        const text = decoder.write(chunk);
+        if (text) send('', { n: s.name, t: text });
+      }
+    }
+    send('run', { n: s.name, label: 'current run' });
+  };
+  streams.forEach((s) => { sendOlder(s); pump(s); });
   const unwatch = streams.map((s) => watchLog(s.file, () => pump(s)));
   const ping = setInterval(() => res.write(': ping\n\n'), 20000); // keeps idle proxies from dropping it
   req.on('close', () => { clearInterval(ping); unwatch.forEach((fn) => fn()); });
 }
 
 function showLogText(res, name, query) {
+  const parts = logHistory(name, clampLines(query, LOG_LINES));
+  const text = parts.map((p) => {
+    let body = '';
+    try { body = readRange(p.file, p.start, p.end).toString('utf8'); } catch {}
+    if (parts.length > 1) body = `----- ${name}: ${p.label} -----\n${body}${body && !body.endsWith('\n') ? '\n' : ''}`;
+    return body;
+  }).join('');
   res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
-  res.end(launcher.tail(name, clampLines(query, LOG_LINES)) || '(no log yet)\n');
+  res.end(text || '(no log yet)\n');
 }
 
 const LOG_STYLE = `
@@ -585,11 +637,10 @@ function logClient(opts) {
   }
 
   function handle(ev) {
-    if (ev.type === 'reset') {
+    if (ev.type === 'reset' || ev.type === 'run') {
       const name = ev.data.n;
-      if (!opts.combined) out.textContent = '';
-      delete streams[name];
-      sysLine(`— ${name}: new log (server restarted) —`);
+      delete streams[name]; // colors don't carry over between runs
+      sysLine(ev.type === 'reset' ? `— ${name}: server restarted —` : `— ${name}: ${ev.data.label} —`);
     } else {
       write(ev.data.n, ev.data.t);
     }
@@ -617,6 +668,7 @@ function logClient(opts) {
   const source = new EventSource(opts.streamUrl);
   source.onmessage = (e) => receive('message', e);
   source.addEventListener('reset', (e) => receive('reset', e));
+  source.addEventListener('run', (e) => receive('run', e));
   source.onopen = () => setConn('live', 'live');
   source.onerror = () => {
     if (source.readyState === EventSource.CLOSED) setConn('dead', 'disconnected (reload, or log in again)');
