@@ -10,6 +10,7 @@ const http = require('http');
 const path = require('path');
 const readline = require('readline');
 const { spawn, execFileSync } = require('child_process');
+const { StringDecoder } = require('string_decoder');
 
 const ROOT = __dirname;
 const CONFIG_FILE = path.join(ROOT, 'servers.json');
@@ -41,12 +42,16 @@ commands:
   start   [name...|--all]         start servers
   stop    [name...|--all]         stop servers
   restart [name...|--all]         restart servers (starts them if stopped)
-  logs    [name] [-n N] [--no-follow]
+  logs    [name] [-n N] [--no-follow] [--strip]
                                   show and follow a server's log
   switch  [name|port]             point the running proxy at a server
   help    [command]               help for a command (or: portctl <command> --help)
 
 Commands that take names show a picker when no name is given.
+
+servers.json entries: name, port, cmd, and optionally cwd, env, color.
+"color": true sets FORCE_COLOR=1 and CLICOLOR_FORCE=1 so tools keep their colors
+even though their output goes to a log file (some tools need their own flag too).
 "${PROXY}" is the proxy itself (switch.js); --self is an alias. --all never includes it.
 
 files: ${CONFIG_FILE}
@@ -92,13 +97,14 @@ Stop then start servers. A stopped server is just started.
   name...   one or more servers (or "${PROXY}"); picker if omitted
   --all     every server with a "cmd", except ports in use by something else (not the proxy)`,
 
-  logs: `usage: portctl logs [name] [-n N] [--no-follow]
+  logs: `usage: portctl logs [name] [-n N] [--no-follow] [--strip]
 
 Print the end of run/<name>.log and keep following it (Ctrl+C to quit).
 
   name           server (or "${PROXY}"); picker if omitted
   -n, --lines N  lines to show first (default 40)
-  --no-follow    print and exit`,
+  --no-follow    print and exit
+  --strip        remove terminal color/escape codes (for grep, less, files)`,
 
   switch: `usage: portctl switch [name|port]
 
@@ -224,6 +230,8 @@ async function proxyState(config) {
 }
 
 // ---- start / stop ----------------------------------------------------------
+// "color": true -- most tools drop colors when output isn't a terminal; these force them back.
+const COLOR_ENV = { FORCE_COLOR: '1', CLICOLOR_FORCE: '1' };
 const WIN_WRAPPER = `require('child_process')
   .spawn(process.argv[1], { shell: true, stdio: 'inherit', windowsHide: true })
   .on('exit', (code) => process.exit(code ?? 1));`;
@@ -244,7 +252,7 @@ async function start(entry) {
     detached: true, // own process group, survives this process / the SSH session
     windowsHide: true,
     stdio: ['ignore', log, log],
-    env: { ...process.env, ...entry.env, PORT: String(entry.port) },
+    env: { ...process.env, ...(entry.color && COLOR_ENV), ...entry.env, PORT: String(entry.port) },
   };
   if (entry.name !== PROXY) for (const k of ENV_KEYS) delete opts.env[k];
   // On Windows a detached (console-less) cmd.exe doesn't pass the log handles on to the
@@ -360,21 +368,35 @@ async function cliStatus(config, named) {
   if (named.length && states.some((s) => s.state !== 'running')) process.exitCode = 3;
 }
 
-function cliLogs(entry, { lines, follow }) {
+// Terminal escape sequences: CSI (colors, cursor), OSC (titles, links), and short ones.
+const ANSI_SOURCE = String.raw`\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()#][0-9A-Za-z]|[@-Z\\-_])`;
+const ANSI_RE = new RegExp(ANSI_SOURCE, 'g');
+const ANSI_AT_START = new RegExp(`^${ANSI_SOURCE}`);
+const stripAnsi = (text) => text.replace(ANSI_RE, '');
+
+function cliLogs(entry, { lines, follow, strip }) {
   const file = logFile(entry.name);
   if (!fs.existsSync(file)) throw new Error(`no log for ${entry.name} yet`);
-  if (lines) console.log(tail(entry.name, lines));
+  if (lines) console.log(strip ? stripAnsi(tail(entry.name, lines)) : tail(entry.name, lines));
   if (!follow) return;
   let pos = fs.statSync(file).size;
+  let decoder = new StringDecoder('utf8');
+  let carry = ''; // an escape sequence cut off at the end of a read
   fs.watchFile(file, { interval: 500 }, (cur) => {
-    if (cur.size < pos) pos = 0; // truncated by a restart
+    if (cur.size < pos) { pos = 0; decoder = new StringDecoder('utf8'); carry = ''; } // truncated by a restart
     if (cur.size === pos) return;
     const fd = fs.openSync(file, 'r');
     const buf = Buffer.alloc(cur.size - pos);
     fs.readSync(fd, buf, 0, buf.length, pos);
     fs.closeSync(fd);
     pos = cur.size;
-    process.stdout.write(buf);
+    if (!strip) return process.stdout.write(buf);
+    let text = carry + decoder.write(buf);
+    const esc = text.lastIndexOf('\x1b');
+    const rest = esc === -1 ? '' : text.slice(esc);
+    carry = rest && rest.length < 256 && !ANSI_AT_START.test(rest) ? rest : '';
+    if (carry) text = text.slice(0, esc);
+    process.stdout.write(stripAnsi(text));
   });
 }
 
@@ -421,13 +443,14 @@ async function pick(config, cmd) {
 }
 
 function parseArgs(argv) {
-  const opts = { names: [], all: false, help: false, follow: true, lines: 40 };
+  const opts = { names: [], all: false, help: false, follow: true, lines: 40, strip: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '-h' || a === '--help') opts.help = true;
     else if (a === '-a' || a === '--all') opts.all = true;
     else if (a === '--self') opts.names.push(PROXY);
     else if (a === '--no-follow') opts.follow = false;
+    else if (a === '--strip') opts.strip = true;
     else if (a === '-n' || a === '--lines') {
       opts.lines = Number(argv[++i]);
       if (!(Number.isInteger(opts.lines) && opts.lines >= 0)) throw new Error(`${a} needs a number`);
@@ -483,4 +506,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { loadConfig, findEntry, getState, getPid, probe, start, stop, tail, logFile };
+module.exports = { PROXY, loadConfig, findEntry, getState, getPid, probe, start, stop, tail, logFile };

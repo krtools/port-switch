@@ -5,7 +5,8 @@
 //   GET  /switch                -> page listing servers from servers.json (status, start/stop)
 //   GET  /switch/{port}         -> make {port} the active target, redirect to /
 //   POST /switch/{start|stop|restart}/{name}
-//   GET  /switch/log/{name}     -> tail of run/{name}.log
+//   GET  /switch/log/{name}     -> live log viewer (?raw: plain-text tail), /stream: SSE
+//   GET  /switch/logs           -> every server's log combined, /stream: SSE
 //   GET  /switch/api/state      -> {"target":3001,"name":"..."} (used by portctl)
 //   GET|POST /switch/login, GET /switch/logout
 //   anything else               -> proxied to the active target (incl. WebSockets)
@@ -20,6 +21,8 @@
 const http = require('http');
 const net = require('net');
 const crypto = require('crypto');
+const fs = require('fs');
+const { StringDecoder } = require('string_decoder');
 const launcher = require('./portctl');
 
 // Timestamp every log line, and record why the process ends: the log (run/proxy.log
@@ -248,7 +251,11 @@ async function renderSwitchPage(res, msg) {
 <p>Currently proxying to <b>${esc(nameOf(target))}</b> (:${target})</p>
 ${errors.map((m) => `<p class="msg">${esc(m)}</p>`).join('')}
 ${rows}${custom}
-<p style="margin-top:24px;font-size:13px"><a href="${SWITCH_PATH}/logout" style="color:inherit">Log out</a></p>`, head));
+<p style="margin-top:24px;font-size:13px">
+  <a href="${SWITCH_PATH}/logs" style="color:inherit">All logs</a> &middot;
+  <a href="${SWITCH_PATH}/log/${launcher.PROXY}" style="color:inherit">Proxy log</a> &middot;
+  <a href="${SWITCH_PATH}/logout" style="color:inherit">Log out</a>
+</p>`, head));
 }
 
 function doSwitch(port, res) {
@@ -282,10 +289,356 @@ async function doAction(action, name, res) {
   res.end();
 }
 
-function showLog(name, res) {
-  const entry = config.servers.find((s) => s.name === name);
-  res.writeHead(entry ? 200 : 404, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
-  res.end(entry ? launcher.tail(name, 200) || '(no log yet)\n' : 'unknown server\n');
+// ---- logs ------------------------------------------------------------------
+//   GET /switch/log/{name}          viewer page (?raw or a non-browser client: plain text)
+//   GET /switch/log/{name}/stream   SSE: the last ?lines=N lines, then new output live
+//   GET /switch/logs[/stream]       the same for every server (plus the proxy), combined
+// Each SSE message is {n: name, t: text}; its id holds every file's read position so a
+// reconnect (EventSource sends Last-Event-ID) resumes where it left off. A "reset" event
+// means the log was started over (server restarted).
+
+const logNames = () => [...config.servers.filter((s) => s.cmd).map((s) => s.name), launcher.PROXY];
+const clampLines = (query, dflt) => Math.min(5000, Math.max(0, Number(new URLSearchParams(query).get('lines') ?? dflt) || 0));
+
+function fileSize(file) {
+  try { return fs.statSync(file).size; } catch { return 0; }
+}
+
+function readRange(file, start, end) {
+  if (end <= start) return Buffer.alloc(0);
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(end - start);
+    return buf.subarray(0, fs.readSync(fd, buf, 0, buf.length, start));
+  } finally { fs.closeSync(fd); }
+}
+
+// A log's first line (portctl writes a timestamp there), hashed: when it changes, the file
+// was rewritten by a restart even if it has already grown past our read position.
+function logSignature(file) {
+  let head;
+  try { head = readRange(file, 0, 256); } catch { return '-'; }
+  const nl = head.indexOf(10);
+  return crypto.createHash('sha1').update(nl === -1 ? head : head.subarray(0, nl)).digest('hex').slice(0, 8);
+}
+
+// Byte offset where the last `lines` lines start (looking back at most 256KB).
+function tailOffset(file, lines) {
+  const size = fileSize(file);
+  if (!lines) return size;
+  const from = Math.max(0, size - 256 * 1024);
+  let buf;
+  try { buf = readRange(file, from, size); } catch { return size; }
+  let i = buf.length - (buf[buf.length - 1] === 10 ? 1 : 0);
+  for (let count = 0; i > 0; i--) if (buf[i - 1] === 10 && ++count === lines) break;
+  if (i === 0 && from > 0) i = buf.indexOf(10) + 1; // don't start mid-line
+  return from + i;
+}
+
+// One fs.watchFile per log, shared by every open stream. (Works before the file exists.)
+const logWatchers = new Map();
+function watchLog(file, onChange) {
+  let subs = logWatchers.get(file);
+  if (!subs) {
+    subs = new Set();
+    logWatchers.set(file, subs);
+    fs.watchFile(file, { interval: 300 }, () => { for (const fn of subs) fn(); });
+  }
+  subs.add(onChange);
+  return () => {
+    subs.delete(onChange);
+    if (!subs.size) { fs.unwatchFile(file); logWatchers.delete(file); }
+  };
+}
+
+function parseLastEventId(header) {
+  const resume = {};
+  for (const part of (header || '').split(';')) {
+    const m = /^([\w.-]+)=(\d+)\.(\w+)$/.exec(part);
+    if (m) resume[m[1]] = { offset: Number(m[2]), sig: m[3] };
+  }
+  return resume;
+}
+
+function streamLogs(req, res, names, lines) {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-store, no-transform',
+    'x-accel-buffering': 'no', // nginx: don't buffer the stream
+  });
+  res.on('error', () => {});
+  res.write('retry: 2000\n\n');
+
+  const resume = parseLastEventId(req.headers['last-event-id']);
+  const streams = names.map((name) => {
+    const file = launcher.logFile(name);
+    const sig = logSignature(file);
+    const prev = resume[name];
+    const offset = prev && prev.sig === sig && prev.offset <= fileSize(file) ? prev.offset : tailOffset(file, lines);
+    return { name, file, sig, offset, decoder: new StringDecoder('utf8') };
+  });
+  const id = () => streams.map((s) => `${s.name}=${s.offset}.${s.sig}`).join(';');
+  const send = (event, data) => res.write(`${event ? `event: ${event}\n` : ''}id: ${id()}\ndata: ${JSON.stringify(data)}\n\n`);
+
+  const pump = (s) => {
+    const sig = logSignature(s.file);
+    const size = fileSize(s.file);
+    if (sig !== s.sig || size < s.offset) {
+      Object.assign(s, { sig, offset: 0, decoder: new StringDecoder('utf8') });
+      send('reset', { n: s.name });
+    }
+    while (s.offset < size) {
+      const end = Math.min(size, s.offset + 256 * 1024);
+      let chunk;
+      try { chunk = readRange(s.file, s.offset, end); } catch { return; }
+      s.offset += chunk.length;
+      const text = s.decoder.write(chunk); // holds back a multi-byte character cut in half
+      if (text) send('', { n: s.name, t: text });
+      if (!chunk.length) return;
+    }
+  };
+
+  streams.forEach(pump);
+  const unwatch = streams.map((s) => watchLog(s.file, () => pump(s)));
+  const ping = setInterval(() => res.write(': ping\n\n'), 20000); // keeps idle proxies from dropping it
+  req.on('close', () => { clearInterval(ping); unwatch.forEach((fn) => fn()); });
+}
+
+function showLogText(res, name, query) {
+  res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+  res.end(launcher.tail(name, clampLines(query, 200)) || '(no log yet)\n');
+}
+
+const LOG_STYLE = `
+  html, body { height:100%; }
+  body { display:flex; flex-direction:column; }
+  header { display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--card); }
+  header h1 { margin:0; font-size:16px; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  header a { color:var(--mute); font-size:13px; }
+  .conn { font-size:12px; color:var(--mute); display:flex; align-items:center; gap:6px; }
+  .conn .dot { background:#888; } .conn.live .dot { background:#2bb24c; } .conn.wait .dot { background:#e0a020; } .conn.dead .dot { background:#d0473b; }
+  header button { font-size:13px; padding:4px 10px; } header button[aria-pressed=true] { border-color:var(--acc); color:var(--acc); }
+  #out { flex:1; overflow:auto; margin:0; padding:8px 12px 24px; background:#111214; color:#d6d6d6;
+         font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; white-space:pre; }
+  #out.wrap { white-space:pre-wrap; overflow-wrap:anywhere; }
+  .ln { min-height:1.45em; }
+  .sys { color:#8a8f98; font-style:italic; }
+  .tag { display:inline-block; margin-right:1ch; font-weight:600; }
+  #bottom { position:fixed; right:20px; bottom:20px; display:none; box-shadow:0 2px 8px rgba(0,0,0,.4); }`;
+
+function renderLogViewer(res, { title, streamUrl, combined, names }) {
+  const opts = { streamUrl, combined, tagWidth: Math.max(...names.map((n) => n.length)) };
+  const json = JSON.stringify(opts).replace(/</g, '\\u003c');
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+  res.end(`<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(title)}</title><style>${STYLE}${LOG_STYLE}</style></head><body>
+<header>
+  <a href="${SWITCH_PATH}">&larr; servers</a>
+  <h1>${esc(title)}</h1>
+  <span class="conn wait" id="conn"><span class="dot"></span><span id="conn-text">connecting</span></span>
+  <button id="pause" aria-pressed="false">Pause</button>
+  <button id="wrap" aria-pressed="false">Wrap</button>
+  <button id="clear">Clear</button>
+</header>
+<pre id="out"></pre>
+<button id="bottom">&darr; Latest</button>
+<script>(${logClient.toString()})(${json});</script>
+</body></html>`);
+}
+
+// Runs in the browser (inlined via toString): renders the SSE stream, including ANSI colors.
+function logClient(opts) {
+  const out = document.getElementById('out');
+  const MAX_LINES = 5000;
+  // xterm-ish palette, readable on the dark log background
+  const PALETTE = ['#3b3f45', '#e06c6c', '#7fbf6a', '#d9b25c', '#6b9fe0', '#c67dd6', '#4fbfbf', '#cfd3d8',
+    '#80868e', '#ff8a8a', '#a3e08f', '#f2d27a', '#8fbaff', '#e09ef0', '#7fe0e0', '#ffffff'];
+  const ESC_AT_START = /^\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()#][0-9A-Za-z]|[@-Z\\-_])/;
+  const TOKEN = /\x1b(?:\[([0-?]*)[ -/]*([@-~])|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()#][0-9A-Za-z]|[@-Z\\-_])|\r\n|\r|\n|[^\x1b\r\n]+/g;
+  const streams = {};
+  let paused = false;
+  let queue = [];
+
+  const color256 = (n) => {
+    if (n < 16) return PALETTE[n];
+    if (n >= 232) { const v = 8 + (n - 232) * 10; return `rgb(${v},${v},${v})`; }
+    n -= 16;
+    const c = (x) => (x ? 55 + x * 40 : 0);
+    return `rgb(${c(Math.floor(n / 36))},${c(Math.floor(n / 6) % 6)},${c(n % 6)})`;
+  };
+
+  function applySgr(st, params) {
+    const p = params === '' ? [0] : params.split(';').map((x) => Number(x) || 0);
+    for (let i = 0; i < p.length; i++) {
+      const c = p[i];
+      if (c === 0) Object.assign(st, { fg: null, bg: null, bold: false, dim: false, italic: false, underline: false, inverse: false });
+      else if (c === 1) st.bold = true;
+      else if (c === 2) st.dim = true;
+      else if (c === 3) st.italic = true;
+      else if (c === 4) st.underline = true;
+      else if (c === 7) st.inverse = true;
+      else if (c === 22) st.bold = st.dim = false;
+      else if (c === 23) st.italic = false;
+      else if (c === 24) st.underline = false;
+      else if (c === 27) st.inverse = false;
+      else if (c >= 30 && c <= 37) st.fg = PALETTE[c - 30];
+      else if (c >= 90 && c <= 97) st.fg = PALETTE[c - 82];
+      else if (c >= 40 && c <= 47) st.bg = PALETTE[c - 40];
+      else if (c >= 100 && c <= 107) st.bg = PALETTE[c - 92];
+      else if (c === 39) st.fg = null;
+      else if (c === 49) st.bg = null;
+      else if (c === 38 || c === 48) {
+        let col = null;
+        if (p[i + 1] === 5) { col = color256(p[i + 2] || 0); i += 2; }
+        else if (p[i + 1] === 2) { col = `rgb(${p[i + 2] || 0},${p[i + 3] || 0},${p[i + 4] || 0})`; i += 4; }
+        if (c === 38) st.fg = col; else st.bg = col;
+      }
+    }
+  }
+
+  function styled(st, text) {
+    if (!st.fg && !st.bg && !st.bold && !st.dim && !st.italic && !st.underline && !st.inverse) return document.createTextNode(text);
+    const el = document.createElement('span');
+    el.textContent = text;
+    let fg = st.fg;
+    let bg = st.bg;
+    if (st.inverse) [fg, bg] = [bg || '#111214', fg || '#d6d6d6'];
+    if (fg) el.style.color = fg;
+    if (bg) el.style.background = bg;
+    if (st.bold) el.style.fontWeight = 'bold';
+    if (st.dim) el.style.opacity = '0.6';
+    if (st.italic) el.style.fontStyle = 'italic';
+    if (st.underline) el.style.textDecoration = 'underline';
+    return el;
+  }
+
+  const tagColor = (name) => {
+    let h = 0;
+    for (const ch of name) h = (h * 31 + ch.charCodeAt(0)) % 360;
+    return `hsl(${h},65%,68%)`;
+  };
+
+  function trim() {
+    while (out.childElementCount > MAX_LINES) {
+      const first = out.firstElementChild;
+      for (const st of Object.values(streams)) if (st.line === first) st.line = null;
+      first.remove();
+    }
+  }
+
+  function newLine(name, st) {
+    const el = document.createElement('div');
+    el.className = 'ln';
+    if (opts.combined) {
+      const tag = document.createElement('span');
+      tag.className = 'tag';
+      tag.textContent = name.padEnd(opts.tagWidth);
+      tag.style.color = tagColor(name);
+      el.append(tag);
+    }
+    st.lineStart = el.childNodes.length;
+    out.append(el);
+    st.line = el;
+    trim();
+  }
+
+  function sysLine(text) {
+    const el = document.createElement('div');
+    el.className = 'ln sys';
+    el.textContent = text;
+    out.append(el);
+    for (const st of Object.values(streams)) st.line = null;
+  }
+
+  const stateFor = (name) => (streams[name] ||= { line: null, lineStart: 0, sgr: {}, carry: '', cr: false });
+
+  function write(name, chunk) {
+    const st = stateFor(name);
+    let text = st.carry + chunk;
+    st.carry = '';
+    // Hold back an escape sequence or \r cut off at the end of this chunk.
+    const esc = text.lastIndexOf('\x1b');
+    if (esc !== -1 && text.length - esc < 256 && !ESC_AT_START.test(text.slice(esc))) { st.carry = text.slice(esc); text = text.slice(0, esc); }
+    if (text.endsWith('\r')) { st.carry = '\r' + st.carry; text = text.slice(0, -1); }
+
+    for (const m of text.matchAll(TOKEN)) {
+      const tok = m[0];
+      if (tok === '\n' || tok === '\r\n') {
+        if (!st.line) newLine(name, st);
+        st.line = null;
+        st.cr = false;
+      } else if (tok === '\r') {
+        st.cr = true; // like a terminal: what follows overwrites the line (progress bars)
+      } else if (tok[0] === '\x1b') {
+        if (m[2] === 'm') applySgr(st.sgr, m[1]);
+        else if (m[2] === 'G') st.cr = true;
+      } else {
+        if (!st.line) newLine(name, st);
+        if (st.cr) { while (st.line.childNodes.length > st.lineStart) st.line.lastChild.remove(); st.cr = false; }
+        st.line.append(styled(st.sgr, tok));
+      }
+    }
+  }
+
+  function handle(ev) {
+    if (ev.type === 'reset') {
+      const name = ev.data.n;
+      if (!opts.combined) out.textContent = '';
+      delete streams[name];
+      sysLine(`— ${name}: new log (server restarted) —`);
+    } else {
+      write(ev.data.n, ev.data.t);
+    }
+  }
+
+  const atBottom = () => out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+  const bottomBtn = document.getElementById('bottom');
+  function render(events) {
+    const stick = atBottom();
+    events.forEach(handle);
+    if (stick) out.scrollTop = out.scrollHeight;
+    bottomBtn.style.display = atBottom() ? 'none' : 'block';
+  }
+  out.addEventListener('scroll', () => { bottomBtn.style.display = atBottom() ? 'none' : 'block'; });
+  bottomBtn.onclick = () => { out.scrollTop = out.scrollHeight; };
+
+  function receive(type, e) {
+    const ev = { type, data: JSON.parse(e.data) };
+    if (paused) queue.push(ev); else render([ev]);
+  }
+
+  const conn = document.getElementById('conn');
+  const connText = document.getElementById('conn-text');
+  const setConn = (cls, text) => { conn.className = `conn ${cls}`; connText.textContent = text; };
+  const source = new EventSource(opts.streamUrl);
+  source.onmessage = (e) => receive('message', e);
+  source.addEventListener('reset', (e) => receive('reset', e));
+  source.onopen = () => setConn('live', 'live');
+  source.onerror = () => {
+    if (source.readyState === EventSource.CLOSED) setConn('dead', 'disconnected (reload, or log in again)');
+    else setConn('wait', 'reconnecting');
+  };
+
+  const pauseBtn = document.getElementById('pause');
+  pauseBtn.onclick = () => {
+    paused = !paused;
+    pauseBtn.setAttribute('aria-pressed', paused);
+    pauseBtn.textContent = paused ? 'Resume' : 'Pause';
+    if (!paused) { const q = queue; queue = []; render(q); }
+  };
+  const wrapBtn = document.getElementById('wrap');
+  const setWrap = (on) => {
+    out.classList.toggle('wrap', on);
+    wrapBtn.setAttribute('aria-pressed', on);
+    try { localStorage.setItem('port-switch-wrap', on ? '1' : ''); } catch {}
+  };
+  wrapBtn.onclick = () => setWrap(!out.classList.contains('wrap'));
+  try { setWrap(!!localStorage.getItem('port-switch-wrap')); } catch {}
+  document.getElementById('clear').onclick = () => {
+    out.textContent = '';
+    for (const st of Object.values(streams)) if (st) st.line = null;
+  };
 }
 
 // ---- proxy -----------------------------------------------------------------
@@ -343,7 +696,21 @@ async function handleSwitch(req, res, path, query) {
     req.resume();
     return doAction(parts[0], parts[1], res);
   }
-  if (parts.length === 2 && parts[0] === 'log') return showLog(parts[1], res);
+  if (parts[0] === 'log' && parts.length <= 3 && req.method === 'GET') {
+    const name = parts[1];
+    if (!logNames().includes(name)) { res.writeHead(404, { 'content-type': 'text/plain' }); return res.end('unknown server\n'); }
+    if (parts[2] === 'stream') return streamLogs(req, res, [name], clampLines(query, 200));
+    if (parts.length === 3) { res.writeHead(404); return res.end(); }
+    const browser = /text\/html/.test(req.headers.accept || '');
+    if (!browser || new URLSearchParams(query).has('raw')) return showLogText(res, name, query);
+    const base = `${SWITCH_PATH}/log/${encodeURIComponent(name)}`;
+    return renderLogViewer(res, { title: `${name} log`, streamUrl: `${base}/stream`, combined: false, names: [name] });
+  }
+  if (parts[0] === 'logs' && req.method === 'GET') {
+    const names = logNames();
+    if (parts[1] === 'stream' && parts.length === 2) return streamLogs(req, res, names, clampLines(query, 50));
+    if (parts.length === 1) return renderLogViewer(res, { title: 'All logs', streamUrl: `${SWITCH_PATH}/logs/stream`, combined: true, names });
+  }
   if (parts.join('/') === 'api/state') {
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     return res.end(JSON.stringify({ target, name: nameOf(target) }));
