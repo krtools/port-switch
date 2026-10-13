@@ -1,0 +1,23 @@
+{
+  "name": "port-switch",
+  "version": "1.0.0",
+  "description": "Zero-dependency reverse proxy that switches one port between local dev servers, plus portctl to run them in the background",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=16"
+  },
+  "scripts": {
+    "build": "tsc -p . && node -e \"for (const f of ['servers.example.json', '.env.example']) require('fs').copyFileSync(f, 'dist/' + f)\"",
+    "typecheck": "tsc -p . --noEmit",
+    "watch": "tsc -p . --watch",
+    "portctl": "node dist/portctl.js",
+    "proxy": "node dist/switch.js",
+    "archive:sh": "sh scripts/archive.sh",
+    "archive:win": "scripts\\archive.cmd"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  }
+}

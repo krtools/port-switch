@@ -18,26 +18,33 @@
 // Usage: node switch.js   or   portctl start proxy
 // env: PORT HOST TARGET SWITCH_PASSWORD SWITCH_COOKIE_DAYS (default 365) SWITCH_COOKIE_DOMAIN
 
-const http = require('http');
-const net = require('net');
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
-const { StringDecoder } = require('string_decoder');
-const launcher = require('./portctl');
+import * as http from 'http';
+import * as net from 'net';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
+import type { Duplex } from 'stream';
+import { StringDecoder } from 'string_decoder';
+import * as launcher from './portctl';
+import type { Config, ServerEntry, State } from './portctl';
+import { logClient, type LogClientOptions } from './logClient';
+import { errCode, errMsg, errText } from './util';
+
+type Req = http.IncomingMessage;
+type Res = http.ServerResponse;
 
 // Timestamp every log line, and record why the process ends: the log (run/proxy.log
 // under portctl) is the only trace. If it ends with none of these lines, the process
 // got SIGKILL (e.g. the kernel OOM killer) or the log was cleared by a restart.
-for (const level of ['log', 'error']) {
+for (const level of ['log', 'error'] as const) {
   const write = console[level].bind(console);
-  console[level] = (...args) => write(new Date().toISOString(), ...args);
+  console[level] = (...args: unknown[]) => write(new Date().toISOString(), ...args);
 }
 process.on('uncaughtException', (err, origin) => { // also unhandled rejections
   console.error(`[fatal] ${origin}:`, err);
   process.exit(1);
 });
-for (const [sig, num] of [['SIGTERM', 15], ['SIGINT', 2], ['SIGHUP', 1]]) {
+for (const [sig, num] of [['SIGTERM', 15], ['SIGINT', 2], ['SIGHUP', 1]] as const) {
   process.on(sig, () => { console.log(`[exit] received ${sig}`); process.exit(128 + num); });
 }
 process.on('exit', (code) => console.log(`[exit] code ${code}`));
@@ -46,15 +53,16 @@ const UPSTREAM_HOST = '127.0.0.1';
 const ALLOW_UNREGISTERED = true; // allow /switch/{port} for ports not in servers.json
 
 // servers.json is re-read on every /switch page load; keep the last good copy if it breaks.
-let config;
-let configError = null;
-function reloadConfig() {
-  try { config = launcher.loadConfig(); configError = null; } catch (err) { configError = err.message; }
+let config: Config;
+let configError: string | null = null;
+function reloadConfig(): Config {
+  try { config = launcher.loadConfig(); configError = null; } catch (err) { configError = errMsg(err); }
   return config;
 }
-reloadConfig();
-if (!config) {
-  console.error(`[port-switch] ${configError}`);
+try {
+  config = launcher.loadConfig();
+} catch (err) {
+  console.error(`[port-switch] ${errMsg(err)}`);
   process.exit(1);
 }
 
@@ -65,11 +73,11 @@ const LISTEN_HOST = process.env.HOST || '0.0.0.0';
 let target = Number(process.env.TARGET) || config.servers[0]?.port || 3001;
 
 // Open WebSocket tunnels, killed on switch so clients (e.g. HMR) reconnect to the new target.
-const tunnels = new Set();
+const tunnels = new Set<Duplex>();
 
-const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
-const entryOf = (port) => config.servers.find((s) => s.port === port);
-const nameOf = (port) => entryOf(port)?.name || `port ${port}`;
+const esc = (s: unknown) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+const entryOf = (port: number) => config.servers.find((s) => s.port === port);
+const nameOf = (port: number) => entryOf(port)?.name || `port ${port}`;
 
 // ---- auth ------------------------------------------------------------------
 // Cookie = "<expiry>.<HMAC(password, expiry)>": nothing stored server-side, and
@@ -84,13 +92,13 @@ if (COOKIE_DOMAIN && !/^\.?[a-z0-9-]+(\.[a-z0-9-]+)*$/i.test(COOKIE_DOMAIN)) {
   process.exit(1);
 }
 const MAX_FAILURES = 20; // per 15 minutes, across all clients
-const failures = [];
+const failures: number[] = [];
 
-const sign = (exp) => crypto.createHmac('sha256', PASSWORD).update(`port-switch:${exp}`).digest('base64url');
-const sha = (s) => crypto.createHash('sha256').update(String(s)).digest();
-const safeEqual = (a, b) => crypto.timingSafeEqual(sha(a), sha(b));
+const sign = (exp: string | number) => crypto.createHmac('sha256', PASSWORD).update(`port-switch:${exp}`).digest('base64url');
+const sha = (s: string) => crypto.createHash('sha256').update(s).digest();
+const safeEqual = (a: string, b: string) => crypto.timingSafeEqual(sha(a), sha(b));
 
-function getCookie(req, name) {
+function getCookie(req: Req, name: string): string {
   for (const part of (req.headers.cookie || '').split(';')) {
     const [k, ...v] = part.trim().split('=');
     if (k === name) return v.join('=');
@@ -98,7 +106,7 @@ function getCookie(req, name) {
   return '';
 }
 
-function isAuthed(req) {
+function isAuthed(req: Req): boolean {
   if (!PASSWORD) return false;
   const bearer = /^Bearer (.+)$/.exec(req.headers.authorization || '')?.[1];
   if (bearer) return safeEqual(bearer, PASSWORD);
@@ -106,23 +114,25 @@ function isAuthed(req) {
   return Number(exp) > Date.now() / 1000 && !!sig && safeEqual(sig, sign(exp));
 }
 
-function authCookie(req, maxAge) {
+function authCookie(req: Req, maxAge: number): string {
   const exp = Math.floor(Date.now() / 1000) + maxAge;
   const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
   const domain = COOKIE_DOMAIN ? `; Domain=${COOKIE_DOMAIN}` : '';
   return `${COOKIE}=${maxAge ? `${exp}.${sign(exp)}` : ''}; Path=${SWITCH_PATH}; Max-Age=${maxAge}; HttpOnly; SameSite=Lax${domain}${secure}`;
 }
 
-function tooManyFailures() {
+function tooManyFailures(): boolean {
   const cutoff = Date.now() - 15 * 60e3;
   while (failures.length && failures[0] < cutoff) failures.shift();
   return failures.length >= MAX_FAILURES;
 }
 
 // Only redirect back into /switch after logging in.
-const safeNext = (next) => (typeof next === 'string' && (next === SWITCH_PATH || next.startsWith(SWITCH_PATH + '/') || next.startsWith(SWITCH_PATH + '?')) ? next : SWITCH_PATH);
+const safeNext = (next: string | null | undefined): string =>
+  typeof next === 'string' && (next === SWITCH_PATH || next.startsWith(SWITCH_PATH + '/') || next.startsWith(SWITCH_PATH + '?'))
+    ? next : SWITCH_PATH;
 
-function renderLogin(res, status, next, msg) {
+function renderLogin(res: Res, status: number, next: string, msg?: string): void {
   res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
   res.end(page('Log in', `
 <h1>Switch server</h1>
@@ -135,18 +145,18 @@ ${msg ? `<p class="msg">${esc(msg)}</p>` : ''}
 </form>`));
 }
 
-function readBody(req, limit = 4096) {
+function readBody(req: Req, limit = 4096): Promise<string> {
   return new Promise((resolve, reject) => {
     let body = '';
     req.setEncoding('utf8');
-    req.on('data', (c) => { body += c; if (body.length > limit) { reject(new Error('body too large')); req.destroy(); } });
+    req.on('data', (c: string) => { body += c; if (body.length > limit) { reject(new Error('body too large')); req.destroy(); } });
     req.on('end', () => resolve(body));
     req.on('error', reject);
   });
 }
 
-async function doLogin(req, res) {
-  let form;
+async function doLogin(req: Req, res: Res): Promise<void> {
+  let form: URLSearchParams;
   try { form = new URLSearchParams(await readBody(req)); } catch { return; }
   const next = safeNext(form.get('next'));
   if (tooManyFailures()) return renderLogin(res, 429, next, 'Too many failed attempts. Try again in a few minutes.');
@@ -160,19 +170,19 @@ async function doLogin(req, res) {
   res.end();
 }
 
-// Handles login/logout and rejects unauthenticated requests. Returns true if it responded.
-async function guard(req, res, path) {
+/** Handles login/logout and rejects unauthenticated requests. Returns true if it responded. */
+async function guard(req: Req, res: Res, urlPath: string): Promise<boolean> {
   if (!PASSWORD) {
     res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
     res.end('The switch page is locked: set SWITCH_PASSWORD in .env next to switch.js, then restart the proxy.\n');
     return true;
   }
-  if (path === `${SWITCH_PATH}/login`) {
+  if (urlPath === `${SWITCH_PATH}/login`) {
     if (req.method === 'POST') await doLogin(req, res);
-    else renderLogin(res, 200, safeNext(new URLSearchParams(req.url.split('?')[1] || '').get('next')));
+    else renderLogin(res, 200, safeNext(new URLSearchParams((req.url ?? '').split('?')[1] || '').get('next')));
     return true;
   }
-  if (path === `${SWITCH_PATH}/logout`) {
+  if (urlPath === `${SWITCH_PATH}/logout`) {
     res.writeHead(303, { location: SWITCH_PATH, 'set-cookie': authCookie(req, 0), 'cache-control': 'no-store' });
     res.end();
     return true;
@@ -205,18 +215,22 @@ const STYLE = `
   input, button { font:inherit; padding:6px 10px; border-radius:6px; border:1px solid var(--line); background:var(--card); color:inherit; }
   input { flex:1; } button { cursor:pointer; } button:hover { border-color:var(--acc); }`;
 
-const page = (title, body, head = '') => `<!doctype html><html><head><meta charset="utf-8">
+const page = (title: string, body: string, head = '') => `<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">${head}
 <title>${esc(title)}</title><style>${STYLE}</style></head><body><main>${body}</main></body></html>`;
 
-const actionButton = (action, name) =>
+type Action = 'start' | 'stop' | 'restart';
+const ACTIONS: readonly Action[] = ['start', 'stop', 'restart'];
+
+const actionButton = (action: Action, name: string) =>
   `<form method="post" action="${SWITCH_PATH}/${action}/${encodeURIComponent(name)}"><button>${action[0].toUpperCase() + action.slice(1)}</button></form>`;
 
-async function renderSwitchPage(res, msg) {
+async function renderSwitchPage(res: Res, msg: string | null): Promise<void> {
   reloadConfig();
   const ports = [...new Set([...config.servers.map((s) => s.port), target])];
-  const entries = ports.map((port) => entryOf(port) || { name: `port ${port}`, port, unregistered: true });
-  const states = await Promise.all(entries.map((e) =>
+  const entries = ports.map((port): ServerEntry & { unregistered?: boolean } =>
+    entryOf(port) || { name: `port ${port}`, port, unregistered: true });
+  const states = await Promise.all(entries.map((e): Promise<{ state: State }> =>
     e.unregistered ? launcher.probe(e.port).then((up) => ({ state: up ? 'external' : 'stopped' })) : launcher.getState(e)));
 
   const rows = entries.map((e, i) => {
@@ -259,11 +273,12 @@ ${rows}${custom}
 </p>`, head));
 }
 
-function doSwitch(port, res) {
+function doSwitch(port: number, res: Res): void {
   const known = config.servers.some((s) => s.port === port);
   if (!(port > 0 && port < 65536) || port === LISTEN_PORT || (!known && !ALLOW_UNREGISTERED)) {
     res.writeHead(400, { 'content-type': 'text/plain' });
-    return res.end(`Not allowed: ${port}\n`);
+    res.end(`Not allowed: ${port}\n`);
+    return;
   }
   if (port !== target) {
     console.log(`[switch] ${target} -> ${port} (${nameOf(port)})`);
@@ -275,7 +290,7 @@ function doSwitch(port, res) {
   res.end();
 }
 
-async function doAction(action, name, res) {
+async function doAction(action: Action, name: string, res: Res): Promise<void> {
   const entry = reloadConfig().servers.find((s) => s.name === name);
   let msg = '';
   try {
@@ -284,7 +299,7 @@ async function doAction(action, name, res) {
     if (action !== 'stop') await launcher.start(entry);
     console.log(`[switch] ${action} ${name}`);
   } catch (err) {
-    msg = `${action} ${name}: ${err.message}`;
+    msg = `${action} ${name}: ${errMsg(err)}`;
   }
   res.writeHead(303, { location: SWITCH_PATH + (msg ? `?msg=${encodeURIComponent(msg)}` : ''), 'cache-control': 'no-store' });
   res.end();
@@ -302,14 +317,15 @@ async function doAction(action, name, res) {
 
 const logNames = () => [...config.servers.filter((s) => s.cmd).map((s) => s.name), launcher.PROXY];
 const LOG_LINES = 1000; // default history for one server's log (the combined view: 50 per server)
-const linesParam = (query) => (new URLSearchParams(query).has('lines') ? `?lines=${clampLines(query, 0)}` : '');
-const clampLines = (query, dflt) => Math.min(5000, Math.max(0, Number(new URLSearchParams(query).get('lines') ?? dflt) || 0));
+const clampLines = (query: string, dflt: number) =>
+  Math.min(5000, Math.max(0, Number(new URLSearchParams(query).get('lines') ?? dflt) || 0));
+const linesParam = (query: string) => (new URLSearchParams(query).has('lines') ? `?lines=${clampLines(query, 0)}` : '');
 
-function fileSize(file) {
+function fileSize(file: string): number {
   try { return fs.statSync(file).size; } catch { return 0; }
 }
 
-function readRange(file, start, end) {
+function readRange(file: string, start: number, end: number): Buffer {
   if (end <= start) return Buffer.alloc(0);
   const fd = fs.openSync(file, 'r');
   try {
@@ -318,26 +334,26 @@ function readRange(file, start, end) {
   } finally { fs.closeSync(fd); }
 }
 
-// A log's first line (portctl writes a timestamp there), hashed: when it changes, the file
-// was rewritten by a restart even if it has already grown past our read position.
-// null if the file doesn't exist; throws if it exists but can't be read.
-function logSignature(file) {
-  let head;
+/** A log's first line (portctl writes a timestamp there), hashed: when it changes, the file
+ *  was rewritten by a restart even if it has already grown past our read position.
+ *  null if the file doesn't exist; throws if it exists but can't be read. */
+function logSignature(file: string): string | null {
+  let head: Buffer;
   try { head = readRange(file, 0, 256); } catch (err) {
-    if (err.code === 'ENOENT') return null; // not there (yet), e.g. mid-restart
+    if (errCode(err) === 'ENOENT') return null; // not there (yet), e.g. mid-restart
     throw err; // there but unreadable: the caller reports it
   }
   const nl = head.indexOf(10);
   return crypto.createHash('sha1').update(nl === -1 ? head : head.subarray(0, nl)).digest('hex').slice(0, 8);
 }
 
-// Where the last `lines` lines of a file start (looking back at most 1MB), and how many
-// lines that actually is (fewer if the file is shorter).
-function tailOffset(file, lines) {
+/** Where the last `lines` lines of a file start (looking back at most 1MB), and how many
+ *  lines that actually is (fewer if the file is shorter). */
+function tailOffset(file: string, lines: number): { offset: number; count: number } {
   const size = fileSize(file);
   if (!lines) return { offset: size, count: 0 };
   const from = Math.max(0, size - 1024 * 1024);
-  let buf;
+  let buf: Buffer;
   try { buf = readRange(file, from, size); } catch { return { offset: size, count: 0 }; }
   let i = buf.length - (buf[buf.length - 1] === 10 ? 1 : 0);
   for (let count = 0; i > 0; i--) if (buf[i - 1] === 10 && ++count === lines) break;
@@ -349,12 +365,14 @@ function tailOffset(file, lines) {
   return { offset: from + i, count };
 }
 
-// The last `lines` lines of a server's log, reaching back into previous runs
-// (<name>.log.1, .2, ... kept by portctl) when the current run is shorter.
-// Oldest first; the last part is always the current log.
-function logHistory(name, lines) {
+interface HistoryPart { file: string; label: string; start: number; end: number }
+
+/** The last `lines` lines of a server's log, reaching back into previous runs
+ *  (<name>.log.1, .2, ... kept by portctl) when the current run is shorter.
+ *  Oldest first; the last part is always the current log. */
+function logHistory(name: string, lines: number): HistoryPart[] {
   const file = launcher.logFile(name);
-  const parts = [];
+  const parts: HistoryPart[] = [];
   let need = lines;
   for (let run = 0; run === 0 || (need > 0 && run <= 100); run++) {
     const f = run ? `${file}.${run}` : file;
@@ -367,23 +385,25 @@ function logHistory(name, lines) {
 }
 
 // One fs.watchFile per log, shared by every open stream. (Works before the file exists.)
-const logWatchers = new Map();
-function watchLog(file, onChange) {
+const logWatchers = new Map<string, Set<() => void>>();
+function watchLog(file: string, onChange: () => void): () => void {
   let subs = logWatchers.get(file);
   if (!subs) {
-    subs = new Set();
-    logWatchers.set(file, subs);
-    fs.watchFile(file, { interval: 300 }, () => { for (const fn of subs) fn(); });
+    const created = new Set<() => void>();
+    subs = created;
+    logWatchers.set(file, created);
+    fs.watchFile(file, { interval: 300 }, () => { for (const fn of created) fn(); });
   }
-  subs.add(onChange);
+  const mine = subs;
+  mine.add(onChange);
   return () => {
-    subs.delete(onChange);
-    if (!subs.size) { fs.unwatchFile(file); logWatchers.delete(file); }
+    mine.delete(onChange);
+    if (!mine.size) { fs.unwatchFile(file); logWatchers.delete(file); }
   };
 }
 
-function parseLastEventId(header) {
-  const resume = {};
+function parseLastEventId(header: string | undefined): Record<string, { offset: number; sig: string }> {
+  const resume: Record<string, { offset: number; sig: string }> = {};
   for (const part of (header || '').split(';')) {
     const m = /^([\w.-]+)=(\d+)\.(\w+)$/.exec(part);
     if (m) resume[m[1]] = { offset: Number(m[2]), sig: m[3] };
@@ -391,11 +411,21 @@ function parseLastEventId(header) {
   return resume;
 }
 
+interface LogStream {
+  name: string;
+  file: string;
+  sig: string | null;
+  offset: number;
+  older: HistoryPart[];
+  decoder: StringDecoder;
+  error?: string;
+}
+
 const MAX_STREAMS = 64; // open log streams; past this the oldest is closed (its viewer reconnects)
 const MAX_BUFFERED = 8 * 1024 * 1024; // a client this far behind is dropped; it resumes on reconnect
-const openStreams = new Set();
+const openStreams = new Set<(why?: string) => void>();
 
-function streamLogs(req, res, names, lines) {
+function streamLogs(req: Req, res: Res, names: string[], lines: number): void {
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-store, no-transform',
@@ -406,9 +436,9 @@ function streamLogs(req, res, names, lines) {
   req.socket.setNoDelay(true);
 
   let closed = false;
-  let unwatch = [];
-  let ping;
-  const close = (why) => {
+  let unwatch: (() => void)[] = [];
+  let ping: ReturnType<typeof setInterval> | undefined;
+  const close = (why?: string) => {
     if (closed) return;
     closed = true;
     clearInterval(ping);
@@ -418,43 +448,43 @@ function streamLogs(req, res, names, lines) {
     res.destroy();
   };
   res.on('close', () => close());
-  res.on('error', (err) => close(err.code || err.message));
+  res.on('error', (err) => close(errText(err)));
   openStreams.add(close);
-  if (openStreams.size > MAX_STREAMS) openStreams.values().next().value('too many open log streams');
+  if (openStreams.size > MAX_STREAMS) openStreams.values().next().value?.('too many open log streams');
   res.write('retry: 2000\n\n');
 
-  const resume = parseLastEventId(req.headers['last-event-id']);
-  const streams = names.map((name) => {
+  const resume = parseLastEventId(req.headers['last-event-id'] as string | undefined);
+  const streams = names.map((name): LogStream => {
     const file = launcher.logFile(name);
-    let sig = null;
+    let sig: string | null = null;
     try { sig = logSignature(file); } catch {}
     const prev = resume[name];
-    if (prev && prev.sig === sig && prev.offset <= fileSize(file)) {
+    if (prev && sig !== null && prev.sig === sig && prev.offset <= fileSize(file)) {
       return { name, file, sig, offset: prev.offset, older: [], decoder: new StringDecoder('utf8') };
     }
     const parts = logHistory(name, lines);
-    const current = parts.pop();
+    const current = parts.pop() as HistoryPart;
     return { name, file, sig, offset: current.start, older: parts, decoder: new StringDecoder('utf8') };
   });
   const id = () => streams.map((s) => `${s.name}=${s.offset}.${s.sig}`).join(';');
-  const send = (event, data) => {
+  const send = (event: string, data: object) => {
     if (closed) return;
     res.write(`${event ? `event: ${event}\n` : ''}id: ${id()}\ndata: ${JSON.stringify(data)}\n\n`);
     if (res.writableLength > MAX_BUFFERED) close('client too slow');
   };
 
   // Tell the viewer once when a log can't be read (e.g. permissions), and again when it can.
-  const readError = (s, err) => {
-    const msg = err ? `can't read ${path.basename(s.file)}: ${err.code || err.message}` : '';
+  const readError = (s: LogStream, err: unknown) => {
+    const msg = err ? `can't read ${path.basename(s.file)}: ${errText(err)}` : '';
     if (msg === (s.error || '')) return;
     s.error = msg;
     send('notice', { n: s.name, text: msg || `${path.basename(s.file)} is readable again` });
   };
 
-  const pump = (s) => {
+  const pump = (s: LogStream) => {
     if (closed) return;
     try {
-      let sig;
+      let sig: string | null;
       try { sig = logSignature(s.file); } catch (err) { return readError(s, err); }
       if (sig === null) return; // gone for the moment (a restart renames it, then writes the new one)
       if (s.error) readError(s, null);
@@ -465,7 +495,7 @@ function streamLogs(req, res, names, lines) {
       }
       while (s.offset < size && !closed) {
         const end = Math.min(size, s.offset + 256 * 1024);
-        let chunk;
+        let chunk: Buffer;
         try { chunk = readRange(s.file, s.offset, end); } catch (err) { return readError(s, err); }
         s.offset += chunk.length;
         const text = s.decoder.write(chunk); // holds back a multi-byte character cut in half
@@ -479,15 +509,15 @@ function streamLogs(req, res, names, lines) {
   };
 
   // History from previous runs first (those files don't change), then the live log.
-  const sendOlder = (s) => {
+  const sendOlder = (s: LogStream) => {
     if (!s.older.length) return;
     for (const part of s.older) {
       send('run', { n: s.name, label: part.label });
       const decoder = new StringDecoder('utf8');
       for (let pos = part.start; pos < part.end;) {
-        let chunk;
+        let chunk: Buffer;
         try { chunk = readRange(part.file, pos, Math.min(part.end, pos + 256 * 1024)); } catch (err) {
-          send('notice', { n: s.name, text: `can't read ${path.basename(part.file)}: ${err.code || err.message}` });
+          send('notice', { n: s.name, text: `can't read ${path.basename(part.file)}: ${errText(err)}` });
           break;
         }
         if (!chunk.length) break;
@@ -509,7 +539,7 @@ function streamLogs(req, res, names, lines) {
   ping = setInterval(() => { if (!closed) res.write(': ping\n\n'); }, 20000); // keeps idle proxies from dropping it
 }
 
-function showLogText(res, name, query) {
+function showLogText(res: Res, name: string, query: string): void {
   const parts = logHistory(name, clampLines(query, LOG_LINES));
   const text = parts.map((p) => {
     let body = '';
@@ -538,8 +568,8 @@ const LOG_STYLE = `
   .tag { display:inline-block; margin-right:1ch; font-weight:600; }
   #bottom { position:fixed; right:20px; bottom:20px; display:none; box-shadow:0 2px 8px rgba(0,0,0,.4); }`;
 
-function renderLogViewer(res, { title, streamUrl, combined, names }) {
-  const opts = { streamUrl, combined, tagWidth: Math.max(...names.map((n) => n.length)) };
+function renderLogViewer(res: Res, { title, streamUrl, combined, names }: { title: string; streamUrl: string; combined: boolean; names: string[] }): void {
+  const opts: LogClientOptions = { streamUrl, combined, tagWidth: Math.max(...names.map((n) => n.length)) };
   const json = JSON.stringify(opts).replace(/</g, '\\u003c');
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
   res.end(`<!doctype html><html><head><meta charset="utf-8">
@@ -559,235 +589,38 @@ function renderLogViewer(res, { title, streamUrl, combined, names }) {
 </body></html>`);
 }
 
-// Runs in the browser (inlined via toString): renders the SSE stream, including ANSI colors.
-function logClient(opts) {
-  const out = document.getElementById('out');
-  const MAX_LINES = 5000;
-  // xterm-ish palette, readable on the dark log background
-  const PALETTE = ['#3b3f45', '#e06c6c', '#7fbf6a', '#d9b25c', '#6b9fe0', '#c67dd6', '#4fbfbf', '#cfd3d8',
-    '#80868e', '#ff8a8a', '#a3e08f', '#f2d27a', '#8fbaff', '#e09ef0', '#7fe0e0', '#ffffff'];
-  const ESC_AT_START = /^\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()#][0-9A-Za-z]|[@-Z\\-_])/;
-  const TOKEN = /\x1b(?:\[([0-?]*)[ -/]*([@-~])|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()#][0-9A-Za-z]|[@-Z\\-_])|\r\n|\r|\n|[^\x1b\r\n]+/g;
-  const streams = {};
-  let paused = false;
-  let queue = [];
-
-  const color256 = (n) => {
-    if (n < 16) return PALETTE[n];
-    if (n >= 232) { const v = 8 + (n - 232) * 10; return `rgb(${v},${v},${v})`; }
-    n -= 16;
-    const c = (x) => (x ? 55 + x * 40 : 0);
-    return `rgb(${c(Math.floor(n / 36))},${c(Math.floor(n / 6) % 6)},${c(n % 6)})`;
-  };
-
-  function applySgr(st, params) {
-    const p = params === '' ? [0] : params.split(';').map((x) => Number(x) || 0);
-    for (let i = 0; i < p.length; i++) {
-      const c = p[i];
-      if (c === 0) Object.assign(st, { fg: null, bg: null, bold: false, dim: false, italic: false, underline: false, inverse: false });
-      else if (c === 1) st.bold = true;
-      else if (c === 2) st.dim = true;
-      else if (c === 3) st.italic = true;
-      else if (c === 4) st.underline = true;
-      else if (c === 7) st.inverse = true;
-      else if (c === 22) st.bold = st.dim = false;
-      else if (c === 23) st.italic = false;
-      else if (c === 24) st.underline = false;
-      else if (c === 27) st.inverse = false;
-      else if (c >= 30 && c <= 37) st.fg = PALETTE[c - 30];
-      else if (c >= 90 && c <= 97) st.fg = PALETTE[c - 82];
-      else if (c >= 40 && c <= 47) st.bg = PALETTE[c - 40];
-      else if (c >= 100 && c <= 107) st.bg = PALETTE[c - 92];
-      else if (c === 39) st.fg = null;
-      else if (c === 49) st.bg = null;
-      else if (c === 38 || c === 48) {
-        let col = null;
-        if (p[i + 1] === 5) { col = color256(p[i + 2] || 0); i += 2; }
-        else if (p[i + 1] === 2) { col = `rgb(${p[i + 2] || 0},${p[i + 3] || 0},${p[i + 4] || 0})`; i += 4; }
-        if (c === 38) st.fg = col; else st.bg = col;
-      }
-    }
-  }
-
-  function styled(st, text) {
-    if (!st.fg && !st.bg && !st.bold && !st.dim && !st.italic && !st.underline && !st.inverse) return document.createTextNode(text);
-    const el = document.createElement('span');
-    el.textContent = text;
-    let fg = st.fg;
-    let bg = st.bg;
-    if (st.inverse) [fg, bg] = [bg || '#111214', fg || '#d6d6d6'];
-    if (fg) el.style.color = fg;
-    if (bg) el.style.background = bg;
-    if (st.bold) el.style.fontWeight = 'bold';
-    if (st.dim) el.style.opacity = '0.6';
-    if (st.italic) el.style.fontStyle = 'italic';
-    if (st.underline) el.style.textDecoration = 'underline';
-    return el;
-  }
-
-  const tagColor = (name) => {
-    let h = 0;
-    for (const ch of name) h = (h * 31 + ch.charCodeAt(0)) % 360;
-    return `hsl(${h},65%,68%)`;
-  };
-
-  function trim() {
-    while (out.childElementCount > MAX_LINES) {
-      const first = out.firstElementChild;
-      for (const st of Object.values(streams)) if (st.line === first) st.line = null;
-      first.remove();
-    }
-  }
-
-  function newLine(name, st) {
-    const el = document.createElement('div');
-    el.className = 'ln';
-    if (opts.combined) {
-      const tag = document.createElement('span');
-      tag.className = 'tag';
-      tag.textContent = name.padEnd(opts.tagWidth);
-      tag.style.color = tagColor(name);
-      el.append(tag);
-    }
-    st.lineStart = el.childNodes.length;
-    out.append(el);
-    st.line = el;
-    trim();
-  }
-
-  function sysLine(text) {
-    const el = document.createElement('div');
-    el.className = 'ln sys';
-    el.textContent = text;
-    out.append(el);
-    for (const st of Object.values(streams)) st.line = null;
-  }
-
-  const stateFor = (name) => (streams[name] ||= { line: null, lineStart: 0, sgr: {}, carry: '', cr: false });
-
-  function write(name, chunk) {
-    const st = stateFor(name);
-    let text = st.carry + chunk;
-    st.carry = '';
-    // Hold back an escape sequence or \r cut off at the end of this chunk.
-    const esc = text.lastIndexOf('\x1b');
-    if (esc !== -1 && text.length - esc < 256 && !ESC_AT_START.test(text.slice(esc))) { st.carry = text.slice(esc); text = text.slice(0, esc); }
-    if (text.endsWith('\r')) { st.carry = '\r' + st.carry; text = text.slice(0, -1); }
-
-    for (const m of text.matchAll(TOKEN)) {
-      const tok = m[0];
-      if (tok === '\n' || tok === '\r\n') {
-        if (!st.line) newLine(name, st);
-        st.line = null;
-        st.cr = false;
-      } else if (tok === '\r') {
-        st.cr = true; // like a terminal: what follows overwrites the line (progress bars)
-      } else if (tok[0] === '\x1b') {
-        if (m[2] === 'm') applySgr(st.sgr, m[1]);
-        else if (m[2] === 'G') st.cr = true;
-      } else {
-        if (!st.line) newLine(name, st);
-        if (st.cr) { while (st.line.childNodes.length > st.lineStart) st.line.lastChild.remove(); st.cr = false; }
-        st.line.append(styled(st.sgr, tok));
-      }
-    }
-  }
-
-  function handle(ev) {
-    if (ev.type === 'notice') {
-      sysLine(`— ${ev.data.n}: ${ev.data.text} —`);
-    } else if (ev.type === 'reset' || ev.type === 'run') {
-      const name = ev.data.n;
-      delete streams[name]; // colors don't carry over between runs
-      sysLine(ev.type === 'reset' ? `— ${name}: server restarted —` : `— ${name}: ${ev.data.label} —`);
-    } else {
-      write(ev.data.n, ev.data.t);
-    }
-  }
-
-  const atBottom = () => out.scrollHeight - out.scrollTop - out.clientHeight < 40;
-  const bottomBtn = document.getElementById('bottom');
-  function render(events) {
-    const stick = atBottom();
-    events.forEach(handle);
-    if (stick) out.scrollTop = out.scrollHeight;
-    bottomBtn.style.display = atBottom() ? 'none' : 'block';
-  }
-  out.addEventListener('scroll', () => { bottomBtn.style.display = atBottom() ? 'none' : 'block'; });
-  bottomBtn.onclick = () => { out.scrollTop = out.scrollHeight; };
-
-  function receive(type, e) {
-    const ev = { type, data: JSON.parse(e.data) };
-    if (paused) queue.push(ev); else render([ev]);
-  }
-
-  const conn = document.getElementById('conn');
-  const connText = document.getElementById('conn-text');
-  const setConn = (cls, text) => { conn.className = `conn ${cls}`; connText.textContent = text; };
-  const source = new EventSource(opts.streamUrl);
-  source.onmessage = (e) => receive('message', e);
-  source.addEventListener('reset', (e) => receive('reset', e));
-  source.addEventListener('run', (e) => receive('run', e));
-  source.addEventListener('notice', (e) => receive('notice', e));
-  source.onopen = () => setConn('live', 'live');
-  source.onerror = () => {
-    if (source.readyState === EventSource.CLOSED) setConn('dead', 'disconnected (reload, or log in again)');
-    else setConn('wait', 'reconnecting');
-  };
-
-  const pauseBtn = document.getElementById('pause');
-  pauseBtn.onclick = () => {
-    paused = !paused;
-    pauseBtn.setAttribute('aria-pressed', paused);
-    pauseBtn.textContent = paused ? 'Resume' : 'Pause';
-    if (!paused) { const q = queue; queue = []; render(q); }
-  };
-  const wrapBtn = document.getElementById('wrap');
-  const setWrap = (on) => {
-    out.classList.toggle('wrap', on);
-    wrapBtn.setAttribute('aria-pressed', on);
-    try { localStorage.setItem('port-switch-wrap', on ? '1' : ''); } catch {}
-  };
-  wrapBtn.onclick = () => setWrap(!out.classList.contains('wrap'));
-  try { setWrap(!!localStorage.getItem('port-switch-wrap')); } catch {}
-  document.getElementById('clear').onclick = () => {
-    out.textContent = '';
-    for (const st of Object.values(streams)) if (st) st.line = null;
-  };
-}
-
 // ---- proxy -----------------------------------------------------------------
 // Rewrite absolute redirects to localhost (e.g. http://localhost:3001/login) into
 // relative ones so they survive the outer HTTPS proxy.
-function fixLocation(loc) {
-  return loc && loc.replace(/^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?(?=\/|$)/i, '') || '/';
+function fixLocation(loc: string): string {
+  return loc.replace(/^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?(?=\/|$)/i, '') || '/';
 }
 
-function upstreamHeaders(req, port) {
-  const headers = { ...req.headers, host: `localhost:${port}` };
+function upstreamHeaders(req: Req, port: number): http.OutgoingHttpHeaders {
+  const headers: http.OutgoingHttpHeaders = { ...req.headers, host: `localhost:${port}` };
   headers['x-forwarded-host'] ??= req.headers.host;
   headers['x-forwarded-proto'] ??= 'http';
   headers['x-forwarded-for'] ??= req.socket.remoteAddress;
   return headers;
 }
 
-function badGateway(res, port, err) {
-  if (res.headersSent) return res.destroy();
+function badGateway(res: Res, port: number, err: unknown): void {
+  if (res.headersSent) { res.destroy(); return; }
   const entry = entryOf(port);
   let running = true;
-  try { running = !!launcher.getPid(entry?.name); } catch {}
+  try { running = !!entry && !!launcher.getPid(entry.name); } catch {}
   const startBtn = entry?.cmd && !running
     ? `<form method="post" action="${SWITCH_PATH}/start/${encodeURIComponent(entry.name)}"><button>Start ${esc(entry.name)}</button></form>` : '';
   res.writeHead(502, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
   res.end(page('502', `
 <h1>${esc(nameOf(port))} (:${port}) isn't responding</h1>
-<p>${esc(err.code || err.message)}</p>${startBtn}
+<p>${esc(errText(err))}</p>${startBtn}
 <p><a href="${SWITCH_PATH}">Switch server &rarr;</a></p>`));
 }
 
-const hasBody = (req) => !!req.headers['transfer-encoding'] || Number(req.headers['content-length']) > 0;
+const hasBody = (req: Req) => !!req.headers['transfer-encoding'] || Number(req.headers['content-length']) > 0;
 
-function proxy(req, res, retry = true) {
+function proxy(req: Req, res: Res, retry = true): void {
   const port = target;
   const up = http.request({
     host: UPSTREAM_HOST, port, method: req.method, path: req.url,
@@ -795,7 +628,7 @@ function proxy(req, res, retry = true) {
   }, (pres) => {
     const headers = { ...pres.headers };
     if (headers.location) headers.location = fixLocation(headers.location);
-    res.writeHead(pres.statusCode, pres.statusMessage, headers);
+    res.writeHead(pres.statusCode ?? 502, pres.statusMessage, headers);
     pres.pipe(res);
     // The server went away mid-response: end the client's response too instead of leaving it hanging.
     pres.on('aborted', () => res.destroy());
@@ -804,11 +637,12 @@ function proxy(req, res, retry = true) {
   up.on('error', (err) => {
     // A reused keep-alive connection that the server closed just as we sent on it. Nothing
     // reached the server, so a request without a body is safe to send again.
-    if (retry && up.reusedSocket && ['ECONNRESET', 'EPIPE'].includes(err.code) && !res.headersSent && !hasBody(req)) {
-      return proxy(req, res, false);
+    if (retry && up.reusedSocket && ['ECONNRESET', 'EPIPE'].includes(errCode(err) ?? '') && !res.headersSent && !hasBody(req)) {
+      proxy(req, res, false);
+      return;
     }
     if (res.destroyed) return; // the client already left; nothing to report to
-    console.log(`[proxy] ${req.method} ${req.url} -> :${port}: ${err.code || err.message}${res.headersSent ? ' (mid-response)' : ''}`);
+    console.log(`[proxy] ${req.method} ${req.url} -> :${port}: ${errText(err)}${res.headersSent ? ' (mid-response)' : ''}`);
     badGateway(res, port, err);
   });
   // The client went away first: drop the upstream request.
@@ -817,23 +651,23 @@ function proxy(req, res, retry = true) {
   else { req.resume(); up.end(); }
 }
 
-async function handleSwitch(req, res, path, query) {
-  if (await guard(req, res, path)) return;
-  if (path === SWITCH_PATH || path === SWITCH_PATH + '/') {
+async function handleSwitch(req: Req, res: Res, urlPath: string, query: string): Promise<void> {
+  if (await guard(req, res, urlPath)) return;
+  if (urlPath === SWITCH_PATH || urlPath === SWITCH_PATH + '/') {
     return renderSwitchPage(res, new URLSearchParams(query).get('msg'));
   }
-  let parts = [];
-  try { parts = path.slice(SWITCH_PATH.length + 1).split('/').filter(Boolean).map(decodeURIComponent); } catch {}
+  let parts: string[] = [];
+  try { parts = urlPath.slice(SWITCH_PATH.length + 1).split('/').filter(Boolean).map(decodeURIComponent); } catch {}
   if (parts.length === 1 && /^\d+$/.test(parts[0])) return doSwitch(Number(parts[0]), res);
-  if (parts.length === 2 && req.method === 'POST' && ['start', 'stop', 'restart'].includes(parts[0])) {
+  if (parts.length === 2 && req.method === 'POST' && (ACTIONS as readonly string[]).includes(parts[0])) {
     req.resume();
-    return doAction(parts[0], parts[1], res);
+    return doAction(parts[0] as Action, parts[1], res);
   }
   if (parts[0] === 'log' && parts.length <= 3 && req.method === 'GET') {
     const name = parts[1];
-    if (!logNames().includes(name)) { res.writeHead(404, { 'content-type': 'text/plain' }); return res.end('unknown server\n'); }
+    if (!logNames().includes(name)) { res.writeHead(404, { 'content-type': 'text/plain' }); res.end('unknown server\n'); return; }
     if (parts[2] === 'stream') return streamLogs(req, res, [name], clampLines(query, LOG_LINES));
-    if (parts.length === 3) { res.writeHead(404); return res.end(); }
+    if (parts.length === 3) { res.writeHead(404); res.end(); return; }
     const browser = /text\/html/.test(req.headers.accept || '');
     if (!browser || new URLSearchParams(query).has('raw')) return showLogText(res, name, query);
     const base = `${SWITCH_PATH}/log/${encodeURIComponent(name)}`;
@@ -846,26 +680,28 @@ async function handleSwitch(req, res, path, query) {
   }
   if (parts.join('/') === 'api/state') {
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-    return res.end(JSON.stringify({ target, name: nameOf(target), logStreams: openStreams.size, websockets: tunnels.size }));
+    res.end(JSON.stringify({ target, name: nameOf(target), logStreams: openStreams.size, websockets: tunnels.size }));
+    return;
   }
   res.writeHead(404, { 'content-type': 'text/plain' });
   res.end('not found\n');
 }
 
 const server = http.createServer((req, res) => {
-  const [path, query = ''] = req.url.split('?');
-  if (path === SWITCH_PATH || path.startsWith(SWITCH_PATH + '/')) {
-    return handleSwitch(req, res, path, query).catch((err) => {
+  const [urlPath, query = ''] = (req.url ?? '/').split('?');
+  if (urlPath === SWITCH_PATH || urlPath.startsWith(SWITCH_PATH + '/')) {
+    handleSwitch(req, res, urlPath, query).catch((err) => {
       console.error('[switch]', err);
       if (!res.headersSent) res.writeHead(500);
       res.end();
     });
+    return;
   }
   proxy(req, res);
 });
 
 // WebSocket / any Upgrade: raw TCP tunnel to the active target.
-server.on('upgrade', (req, socket, head) => {
+server.on('upgrade', (req: Req, socket: Duplex, head: Buffer) => {
   const port = target;
   let connected = false;
   const up = net.connect(port, UPSTREAM_HOST, () => {
@@ -874,20 +710,21 @@ server.on('upgrade', (req, socket, head) => {
     const headers = upstreamHeaders(req, port);
     let raw = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`;
     for (const [k, v] of Object.entries(headers)) {
-      for (const val of [].concat(v)) raw += `${k}: ${val}\r\n`;
+      if (v === undefined) continue;
+      for (const val of Array.isArray(v) ? v : [v]) raw += `${k}: ${val}\r\n`;
     }
     up.write(raw + '\r\n');
     if (head?.length) up.write(head);
     socket.pipe(up).pipe(socket);
   });
   // Small messages (HMR updates) go out at once; dead peers on either side get noticed.
-  for (const s of [socket, up]) { s.setNoDelay(true); s.setKeepAlive(true, 30000); }
+  for (const s of [socket as net.Socket, up]) { s.setNoDelay(true); s.setKeepAlive(true, 30000); }
   up.setTimeout(5000, () => up.destroy(new Error('connect timeout')));
   const close = () => { up.destroy(); socket.destroy(); tunnels.delete(socket); };
   tunnels.add(socket);
   up.on('error', (err) => {
     if (!connected) {
-      console.log(`[proxy] websocket ${req.url} -> :${port}: ${err.code || err.message}`);
+      console.log(`[proxy] websocket ${req.url} -> :${port}: ${errText(err)}`);
       if (socket.writable) socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
     }
     close();
@@ -904,7 +741,7 @@ server.keepAliveTimeout = 150 * 1000;
 server.headersTimeout = 155 * 1000; // must exceed keepAliveTimeout on older Node
 
 // Malformed requests and clients that drop mid-request: answer if possible, never throw.
-server.on('clientError', (err, socket) => {
+server.on('clientError', (err: NodeJS.ErrnoException, socket: Duplex) => {
   if (err.code !== 'ECONNRESET' && socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
   else socket.destroy();
 });

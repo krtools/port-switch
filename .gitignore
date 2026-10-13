@@ -4,3 +4,5 @@ node_modules/
 servers.json
 .r2-sync.json
 .env
+dist/
+release/

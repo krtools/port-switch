@@ -3,21 +3,47 @@
 // Each running server gets run/<name>.pid and run/<name>.log next to this file.
 // Also used as a module by switch.js (start/stop buttons, status dots).
 
-const fs = require('fs');
-const os = require('os');
-const net = require('net');
-const http = require('http');
-const path = require('path');
-const readline = require('readline');
-const { spawn, execFileSync } = require('child_process');
-const { StringDecoder } = require('string_decoder');
+import * as fs from 'fs';
+import * as os from 'os';
+import * as net from 'net';
+import * as http from 'http';
+import * as path from 'path';
+import * as readline from 'readline';
+import { spawn, execFileSync, type SpawnOptions } from 'child_process';
+import { StringDecoder } from 'string_decoder';
+import { sleep, errCode, errMsg } from './util';
 
 const ROOT = __dirname;
 const CONFIG_FILE = path.join(ROOT, 'servers.json');
 const RUN_DIR = path.join(ROOT, 'run');
 const ENV_FILE = path.join(ROOT, '.env');
-const PROXY = 'proxy'; // the proxy itself (switch.js); --self is an alias
+export const PROXY = 'proxy'; // the proxy itself (switch.js); --self is an alias
 const RESERVED = new Set([PROXY, 'self', 'all']);
+
+export interface ServerEntry {
+  name: string;
+  port: number;
+  cmd?: string;
+  cwd?: string;
+  env?: Record<string, string>;
+  color?: boolean;
+}
+
+export interface Config {
+  proxy: { port: number; path: string };
+  logs: { keep: number };
+  servers: ServerEntry[];
+}
+
+/** running: ours and answering | starting: ours, port not answering yet
+ *  external: port answering, not started by us | stopped */
+export type State = 'running' | 'starting' | 'external' | 'stopped';
+
+export interface ServerState {
+  pid: number | null;
+  up: boolean;
+  state: State;
+}
 
 // .env next to this file (KEY=value lines, # comments); real environment variables win.
 // Keys from it are kept out of the servers' environments (only the proxy gets them).
@@ -32,7 +58,7 @@ try {
 } catch {}
 
 // ---- help ------------------------------------------------------------------
-const HELP = {
+const HELP: Record<string, string> = {
   portctl: `portctl - run the servers in servers.json in the background, behind the port-switch proxy
 
 usage: portctl <command> [args]
@@ -118,39 +144,62 @@ Show help for portctl or one of its commands.`,
 };
 const COMMANDS = Object.keys(HELP).filter((k) => k !== 'portctl');
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 // ---- config ----------------------------------------------------------------
-function loadConfig() {
-  const raw = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+const isPort = (v: unknown): v is number => Number.isInteger(v) && (v as number) >= 1 && (v as number) <= 65535;
+
+export function loadConfig(): Config {
+  const raw: unknown = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  if (!isObject(raw)) throw new Error('servers.json: must be a JSON object');
+  if (raw.proxy !== undefined && !isObject(raw.proxy)) throw new Error('servers.json: "proxy" must be an object');
+  if (raw.logs !== undefined && !isObject(raw.logs)) throw new Error('servers.json: "logs" must be an object');
+  if (raw.servers !== undefined && !Array.isArray(raw.servers)) throw new Error('servers.json: "servers" must be a list');
+
   const proxy = { port: 3000, path: '/switch', ...raw.proxy };
+  if (!isPort(proxy.port)) throw new Error('servers.json: proxy.port must be a port number');
+  if (typeof proxy.path !== 'string' || !/^\/[\w.~-]+(\/[\w.~-]+)*$/.test(proxy.path)) {
+    throw new Error('servers.json: proxy.path must look like "/switch"');
+  }
   const logs = { keep: 5, ...raw.logs };
-  if (!Number.isInteger(logs.keep) || logs.keep < 0 || logs.keep > 100) throw new Error('servers.json: logs.keep must be a whole number from 0 to 100');
-  const names = new Set();
-  const ports = new Set([proxy.port]);
-  const servers = (raw.servers || []).map((s, i) => {
+  if (!Number.isInteger(logs.keep) || logs.keep < 0 || logs.keep > 100) {
+    throw new Error('servers.json: logs.keep must be a whole number from 0 to 100');
+  }
+
+  const names = new Set<string>();
+  const ports = new Set<number>([proxy.port]);
+  const servers = ((raw.servers as unknown[] | undefined) ?? []).map((s, i): ServerEntry => {
     const where = `servers.json servers[${i}]`;
-    if (!/^\w[\w.-]*$/.test(s.name || '')) throw new Error(`${where}: "name" must be letters, digits, _ . - (not starting with . or -)`);
-    if (RESERVED.has(s.name)) throw new Error(`${where}: "${s.name}" is a reserved name`);
-    if (!Number.isInteger(s.port) || s.port < 1 || s.port > 65535) throw new Error(`${where}: bad "port"`);
-    if (names.has(s.name)) throw new Error(`${where}: duplicate name "${s.name}"`);
-    if (ports.has(s.port)) throw new Error(`${where}: port ${s.port} is already used`);
-    names.add(s.name);
-    ports.add(s.port);
-    return s;
+    if (!isObject(s)) throw new Error(`${where}: must be an object`);
+    const { name, port, cmd, cwd, env, color } = s;
+    if (typeof name !== 'string' || !/^\w[\w.-]*$/.test(name)) {
+      throw new Error(`${where}: "name" must be letters, digits, _ . - (not starting with . or -)`);
+    }
+    if (RESERVED.has(name)) throw new Error(`${where}: "${name}" is a reserved name`);
+    if (!isPort(port)) throw new Error(`${where}: bad "port"`);
+    if (names.has(name)) throw new Error(`${where}: duplicate name "${name}"`);
+    if (ports.has(port)) throw new Error(`${where}: port ${port} is already used`);
+    if (cmd !== undefined && typeof cmd !== 'string') throw new Error(`${where}: "cmd" must be a string`);
+    if (cwd !== undefined && typeof cwd !== 'string') throw new Error(`${where}: "cwd" must be a string`);
+    if (color !== undefined && typeof color !== 'boolean') throw new Error(`${where}: "color" must be true or false`);
+    if (env !== undefined && !(isObject(env) && Object.values(env).every((v) => typeof v === 'string'))) {
+      throw new Error(`${where}: "env" must be an object of strings`);
+    }
+    names.add(name);
+    ports.add(port);
+    return { name, port, cmd, cwd, env: env as Record<string, string> | undefined, color };
   });
-  return { proxy, logs, servers };
+  return { proxy: proxy as Config['proxy'], logs: logs as Config['logs'], servers };
 }
 
-function proxyEntry(config) {
+function proxyEntry(config: Config): ServerEntry {
   return { name: PROXY, port: config.proxy.port, cwd: ROOT, cmd: `${JSON.stringify(process.execPath)} switch.js` };
 }
 
-function findEntry(config, name) {
+export function findEntry(config: Config, name: string): ServerEntry | undefined {
   return name === PROXY || name === 'self' ? proxyEntry(config) : config.servers.find((s) => s.name === name);
 }
 
-function resolveNames(config, names) {
+function resolveNames(config: Config, names: string[]): ServerEntry[] {
   const entries = [...new Set(names)].map((name) => {
     const entry = findEntry(config, name);
     if (!entry) throw new Error(`unknown server "${name}" (have: ${[PROXY, ...config.servers.map((s) => s.name)].join(', ')})`);
@@ -160,72 +209,70 @@ function resolveNames(config, names) {
 }
 
 // ---- process state ---------------------------------------------------------
-const pidFile = (name) => path.join(RUN_DIR, `${name}.pid`);
-const logFile = (name) => path.join(RUN_DIR, `${name}.log`);
-const resolveCwd = (entry) => path.resolve(ROOT, (entry.cwd || '.').replace(/^~(?=$|[\\/])/, os.homedir()));
+const pidFile = (name: string) => path.join(RUN_DIR, `${name}.pid`);
+export const logFile = (name: string) => path.join(RUN_DIR, `${name}.log`);
+const resolveCwd = (entry: ServerEntry) => path.resolve(ROOT, (entry.cwd || '.').replace(/^~(?=$|[\\/])/, os.homedir()));
 
-function isAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+function isAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (e) { return errCode(e) === 'EPERM'; }
 }
 
-// pid if the server is running, else null (removing a stale pid file).
-function getPid(name) {
-  let pid;
+/** pid if the server is running, else null (removing a stale pid file). */
+export function getPid(name: string): number | null {
+  let pid: number;
   try { pid = Number(fs.readFileSync(pidFile(name), 'utf8')); } catch { return null; }
   if (pid > 0 && isAlive(pid)) return pid;
   try { fs.rmSync(pidFile(name), { force: true }); } catch {} // e.g. no permission; harmless, retried next time
   return null;
 }
 
-function probe(port, timeout = 400) {
+export function probe(port: number, timeout = 400): Promise<boolean> {
   return new Promise((resolve) => {
     const sock = net.connect(port, '127.0.0.1');
-    const done = (up) => { sock.destroy(); resolve(up); };
+    const done = (up: boolean) => { sock.destroy(); resolve(up); };
     sock.setTimeout(timeout, () => done(false));
     sock.once('connect', () => done(true));
     sock.once('error', () => done(false));
   });
 }
 
-// running: ours and answering | starting: ours, port not answering yet
-// external: port answering, not started by us | stopped
-async function getState(entry) {
+export async function getState(entry: ServerEntry): Promise<ServerState> {
   const pid = getPid(entry.name);
   const up = await probe(entry.port);
-  const state = pid ? (up ? 'running' : 'starting') : (up ? 'external' : 'stopped');
+  const state: State = pid ? (up ? 'running' : 'starting') : (up ? 'external' : 'stopped');
   return { pid, up, state };
 }
 
-function uptime(name) {
-  let ms;
+function uptime(name: string): string {
+  let ms: number;
   try { ms = Date.now() - fs.statSync(pidFile(name)).mtimeMs; } catch { return '-'; }
   const s = Math.floor(ms / 1000);
   const [d, h, m] = [Math.floor(s / 86400), Math.floor((s % 86400) / 3600), Math.floor((s % 3600) / 60)];
   return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`;
 }
 
-function tail(name, lines = 40) {
+export function tail(name: string, lines = 40): string {
   try {
     return fs.readFileSync(logFile(name), 'utf8').replace(/\n$/, '').split('\n').slice(-lines).join('\n');
   } catch { return ''; }
 }
 
-// GET a path on the running proxy -> { status, body }
-function proxyRequest(config, urlPath) {
+/** GET a path on the running proxy. */
+function proxyRequest(config: Config, urlPath: string): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
-    const headers = process.env.SWITCH_PASSWORD ? { authorization: `Bearer ${process.env.SWITCH_PASSWORD}` } : {};
+    const headers: http.OutgoingHttpHeaders = process.env.SWITCH_PASSWORD ? { authorization: `Bearer ${process.env.SWITCH_PASSWORD}` } : {};
     const req = http.get({ host: '127.0.0.1', port: config.proxy.port, path: urlPath, headers, timeout: 1500 }, (res) => {
       let body = '';
       res.setEncoding('utf8');
-      res.on('data', (c) => { body += c; });
-      res.on('end', () => resolve({ status: res.statusCode, body }));
+      res.on('data', (c: string) => { body += c; });
+      res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
     });
     req.on('timeout', () => req.destroy(new Error('timeout')));
     req.on('error', reject);
   });
 }
 
-async function proxyState(config) {
+async function proxyState(config: Config): Promise<{ target: number; name: string } | null> {
   try {
     const res = await proxyRequest(config, `${config.proxy.path}/api/state`);
     return res.status === 200 ? JSON.parse(res.body) : null;
@@ -239,7 +286,7 @@ const WIN_WRAPPER = `require('child_process')
   .spawn(process.argv[1], { shell: true, stdio: 'inherit', windowsHide: true })
   .on('exit', (code) => process.exit(code ?? 1));`;
 
-async function start(entry) {
+export async function start(entry: ServerEntry): Promise<number> {
   if (!entry.cmd) throw new Error(`${entry.name} has no "cmd" in servers.json`);
   const running = getPid(entry.name);
   if (running) throw new Error(`${entry.name} is already running (pid ${running})`);
@@ -251,14 +298,15 @@ async function start(entry) {
   rotateLog(entry.name, loadConfig().logs.keep);
   fs.writeFileSync(logFile(entry.name), `# ${new Date().toISOString()}  (cwd ${cwd})\n$ ${entry.cmd}\n`);
   const log = fs.openSync(logFile(entry.name), 'a');
-  const opts = {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...(entry.color && COLOR_ENV), ...entry.env, PORT: String(entry.port) };
+  if (entry.name !== PROXY) for (const k of ENV_KEYS) delete env[k];
+  const opts: SpawnOptions = {
     cwd,
     detached: true, // own process group, survives this process / the SSH session
     windowsHide: true,
     stdio: ['ignore', log, log],
-    env: { ...process.env, ...(entry.color && COLOR_ENV), ...entry.env, PORT: String(entry.port) },
+    env,
   };
-  if (entry.name !== PROXY) for (const k of ENV_KEYS) delete opts.env[k];
   // On Windows a detached (console-less) cmd.exe doesn't pass the log handles on to the
   // programs it runs, so detach a small node wrapper and let it run the shell normally.
   const child = process.platform === 'win32'
@@ -267,12 +315,13 @@ async function start(entry) {
   fs.closeSync(log);
   await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
   child.unref();
-  fs.writeFileSync(pidFile(entry.name), String(child.pid));
-  return child.pid;
+  const pid = child.pid as number; // set once 'spawn' has fired
+  fs.writeFileSync(pidFile(entry.name), String(pid));
+  return pid;
 }
 
-// Keep previous runs' logs: <name>.log -> .log.1 -> .log.2 ... up to `keep` (0 = just overwrite).
-function rotateLog(name, keep) {
+/** Keep previous runs' logs: <name>.log -> .log.1 -> .log.2 ... up to `keep` (0 = just overwrite). */
+function rotateLog(name: string, keep: number): void {
   const file = logFile(name);
   if (!keep || !fs.existsSync(file)) return;
   try {
@@ -283,24 +332,24 @@ function rotateLog(name, keep) {
     fs.renameSync(file, `${file}.1`);
   } catch (err) {
     // e.g. Windows, where a leftover process may still hold the file open; it gets overwritten instead
-    console.error(`warning: couldn't keep the previous log for ${name}: ${err.message}`);
+    console.error(`warning: couldn't keep the previous log for ${name}: ${errMsg(err)}`);
   }
 }
 
 // Kill the whole tree: the pid is the shell, and e.g. `npm run dev` puts the real server in a child.
-function killTree(pid, force) {
+function killTree(pid: number, force: boolean): void {
   try {
     if (process.platform === 'win32') execFileSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' });
     else process.kill(-pid, force ? 'SIGKILL' : 'SIGTERM');
   } catch {}
 }
 
-function groupAlive(pid) {
+function groupAlive(pid: number): boolean {
   if (process.platform === 'win32') return isAlive(pid);
-  try { process.kill(-pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+  try { process.kill(-pid, 0); return true; } catch (e) { return errCode(e) === 'EPERM'; }
 }
 
-async function stop(entry) {
+export async function stop(entry: ServerEntry): Promise<boolean> {
   const pid = getPid(entry.name);
   if (!pid) return false;
   killTree(pid, false);
@@ -311,7 +360,11 @@ async function stop(entry) {
 }
 
 // ---- CLI -------------------------------------------------------------------
-async function waitUp(entry, ms = 15000) {
+type Result = { ok: boolean; msg: string };
+type ActionName = 'start' | 'stop' | 'restart';
+type PickCmd = ActionName | 'logs' | 'switch';
+
+async function waitUp(entry: ServerEntry, ms = 15000): Promise<'up' | 'exited' | 'timeout'> {
   for (const end = Date.now() + ms; Date.now() < end; await sleep(250)) {
     if (await probe(entry.port)) return 'up';
     if (!getPid(entry.name)) return 'exited';
@@ -319,34 +372,35 @@ async function waitUp(entry, ms = 15000) {
   return 'timeout';
 }
 
-const indent = (text) => text.split('\n').map((l) => `    ${l}`).join('\n');
+const indent = (text: string) => text.split('\n').map((l) => `    ${l}`).join('\n');
 
-async function startOne(e) {
+async function startOne(e: ServerEntry): Promise<Result> {
   const pid = getPid(e.name);
   if (pid) return { ok: true, msg: `already running (pid ${pid})` };
-  try { await start(e); } catch (err) { return { ok: false, msg: `error: ${err.message}` }; }
+  try { await start(e); } catch (err) { return { ok: false, msg: `error: ${errMsg(err)}` }; }
   const result = await waitUp(e);
   if (result === 'up') return { ok: true, msg: `up on :${e.port}` };
   if (result === 'timeout') return { ok: true, msg: `started, but :${e.port} isn't answering yet` };
   return { ok: false, msg: `exited! end of ${path.relative(process.cwd(), logFile(e.name))}:\n${indent(tail(e.name, 15))}` };
 }
 
-async function stopOne(e) {
+async function stopOne(e: ServerEntry): Promise<Result> {
   return { ok: true, msg: (await stop(e)) ? 'stopped' : 'not running' };
 }
 
-async function restartOne(e) {
+async function restartOne(e: ServerEntry): Promise<Result> {
   await stop(e);
   return startOne(e);
 }
 
-const ACTIONS = {
+const ACTIONS: Record<ActionName, { fn: (e: ServerEntry) => Promise<Result>; verb?: string }> = {
   start: { fn: startOne, verb: 'starting' },
   stop: { fn: stopOne },
   restart: { fn: restartOne, verb: 'restarting' },
 };
+const isAction = (cmd: string): cmd is ActionName => cmd in ACTIONS;
 
-async function runEach(cmd, entries) {
+async function runEach(cmd: ActionName, entries: ServerEntry[]): Promise<void> {
   const { fn, verb } = ACTIONS[cmd];
   if (verb) console.log(`${verb} ${entries.map((e) => e.name).join(', ')} ...`);
   const results = await Promise.all(entries.map(fn));
@@ -356,12 +410,16 @@ async function runEach(cmd, entries) {
   });
 }
 
-async function runAll(config, cmd) {
+async function runAll(config: Config, cmd: ActionName): Promise<void> {
   const entries = config.servers.filter((e) => e.cmd);
   const states = await Promise.all(entries.map(getState));
-  const want = { start: (s) => s.state === 'stopped', stop: (s) => s.pid, restart: (s) => s.state !== 'external' }[cmd];
+  const want: Record<ActionName, (s: ServerState) => boolean> = {
+    start: (s) => s.state === 'stopped',
+    stop: (s) => !!s.pid,
+    restart: (s) => s.state !== 'external',
+  };
   const todo = entries.filter((e, i) => {
-    if (want(states[i])) return true;
+    if (want[cmd](states[i])) return true;
     if (cmd !== 'stop') console.log(`${e.name}: skipped (${states[i].state})`);
     return false;
   });
@@ -369,19 +427,19 @@ async function runAll(config, cmd) {
   return runEach(cmd, todo);
 }
 
-function printTable(rows) {
+function printTable(rows: (string | number)[][]): void {
   const widths = rows[0].map((_, c) => Math.max(...rows.map((r) => String(r[c]).length)));
   for (const r of rows) console.log(r.map((v, c) => String(v).padEnd(widths[c])).join('  ').trimEnd());
 }
 
-async function cliStatus(config, named) {
+async function cliStatus(config: Config, named: ServerEntry[]): Promise<void> {
   const entries = named.length ? named : [proxyEntry(config), ...config.servers];
   const [states, ps] = await Promise.all([Promise.all(entries.map(getState)), proxyState(config)]);
   const rows = entries.map((e, i) => {
     const s = states[i];
     const note = e.name === PROXY ? (ps ? `-> ${ps.name} (:${ps.target})` : '')
       : ps?.target === e.port ? '* active'
-      : s.state === 'external' ? '(port in use, not ours)' : '';
+        : s.state === 'external' ? '(port in use, not ours)' : '';
     return [e.name, e.port, s.state, s.pid || '-', s.pid ? uptime(e.name) : '-', note];
   });
   printTable([['NAME', 'PORT', 'STATE', 'PID', 'UPTIME', ''], ...rows]);
@@ -392,9 +450,18 @@ async function cliStatus(config, named) {
 const ANSI_SOURCE = String.raw`\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()#][0-9A-Za-z]|[@-Z\\-_])`;
 const ANSI_RE = new RegExp(ANSI_SOURCE, 'g');
 const ANSI_AT_START = new RegExp(`^${ANSI_SOURCE}`);
-const stripAnsi = (text) => text.replace(ANSI_RE, '');
+const stripAnsi = (text: string) => text.replace(ANSI_RE, '');
 
-function cliLogs(entry, { lines, follow, strip }) {
+interface Options {
+  names: string[];
+  all: boolean;
+  help: boolean;
+  follow: boolean;
+  lines: number;
+  strip: boolean;
+}
+
+function cliLogs(entry: ServerEntry, { lines, follow, strip }: Options): void {
   const file = logFile(entry.name);
   if (!fs.existsSync(file)) throw new Error(`no log for ${entry.name} yet`);
   if (lines) console.log(strip ? stripAnsi(tail(entry.name, lines)) : tail(entry.name, lines));
@@ -410,7 +477,7 @@ function cliLogs(entry, { lines, follow, strip }) {
     fs.readSync(fd, buf, 0, buf.length, pos);
     fs.closeSync(fd);
     pos = cur.size;
-    if (!strip) return process.stdout.write(buf);
+    if (!strip) { process.stdout.write(buf); return; }
     let text = carry + decoder.write(buf);
     const esc = text.lastIndexOf('\x1b');
     const rest = esc === -1 ? '' : text.slice(esc);
@@ -420,7 +487,7 @@ function cliLogs(entry, { lines, follow, strip }) {
   });
 }
 
-async function cliSwitch(config, port, label) {
+async function cliSwitch(config: Config, port: number, label: string): Promise<void> {
   let res;
   try {
     res = await proxyRequest(config, `${config.proxy.path}/${port}`);
@@ -433,24 +500,25 @@ async function cliSwitch(config, port, label) {
   console.log(`proxy -> ${label} (:${port})`);
 }
 
-const PICK_FILTERS = {
-  start: ({ e, s }) => e.cmd && s.state === 'stopped',
-  stop: ({ s }) => s.pid,
-  restart: ({ e, s }) => e.cmd && s.state !== 'external',
+type Candidate = { e: ServerEntry; s: ServerState };
+const PICK_FILTERS: Record<PickCmd, (c: Candidate) => boolean> = {
+  start: ({ e, s }) => !!e.cmd && s.state === 'stopped',
+  stop: ({ s }) => !!s.pid,
+  restart: ({ e, s }) => !!e.cmd && s.state !== 'external',
   logs: ({ e }) => fs.existsSync(logFile(e.name)),
   switch: ({ e }) => e.name !== PROXY,
 };
 
-async function pick(config, cmd) {
+async function pick(config: Config, cmd: PickCmd): Promise<ServerEntry[]> {
   const all = [...config.servers, proxyEntry(config)];
   const states = await Promise.all(all.map(getState));
   const list = all.map((e, i) => ({ e, s: states[i] })).filter(PICK_FILTERS[cmd]);
   if (!list.length) throw new Error(`nothing to ${cmd}`);
 
-  const multi = cmd in ACTIONS;
+  const multi = isAction(cmd);
   list.forEach(({ e, s }, i) => console.log(`  ${String(i + 1).padStart(2)}) ${e.name}  :${e.port}  [${s.state}]`));
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const answer = await new Promise((r) => rl.question(`${cmd} which?${multi ? ' (space-separated for several)' : ''} `, r));
+  const answer = await new Promise<string>((r) => rl.question(`${cmd} which?${multi ? ' (space-separated for several)' : ''} `, r));
   rl.close();
   const picks = answer.split(/[\s,]+/).filter(Boolean);
   if (!picks.length) throw new Error('nothing picked');
@@ -462,8 +530,8 @@ async function pick(config, cmd) {
   });
 }
 
-function parseArgs(argv) {
-  const opts = { names: [], all: false, help: false, follow: true, lines: 40, strip: false };
+function parseArgs(argv: string[]): Options {
+  const opts: Options = { names: [], all: false, help: false, follow: true, lines: 40, strip: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '-h' || a === '--help') opts.help = true;
@@ -480,8 +548,8 @@ function parseArgs(argv) {
   return opts;
 }
 
-async function main(argv) {
-  const cmd = argv[0] && !argv[0].startsWith('-') ? argv.shift() : null;
+async function main(argv: string[]): Promise<void> {
+  const cmd = argv[0] && !argv[0].startsWith('-') ? (argv.shift() as string) : null;
   if (cmd === 'help') {
     if (argv[0] && !HELP[argv[0]]) throw new Error(`no help for "${argv[0]}" (commands: ${COMMANDS.join(', ')})`);
     return console.log(HELP[argv[0] || 'portctl']);
@@ -494,26 +562,27 @@ async function main(argv) {
     const hint = fs.existsSync(CONFIG_FILE) && findEntry(loadConfig(), cmd) ? ` (did you mean "portctl start ${cmd}"?)` : '';
     throw new Error(`unknown command "${cmd}"${hint} - see portctl --help`);
   }
-  if (opts.help) return console.log(HELP[cmd]);
+  if (opts.help) return console.log(HELP[cmd as string]);
 
   const config = loadConfig();
   if (!cmd || cmd === 'status') return cliStatus(config, resolveNames(config, opts.names));
+  const pickCmd = cmd as PickCmd;
 
   if (opts.all) {
-    if (!(cmd in ACTIONS)) throw new Error(`--all doesn't apply to ${cmd}`);
+    if (!isAction(pickCmd)) throw new Error(`--all doesn't apply to ${cmd}`);
     if (opts.names.length) throw new Error('give names or --all, not both');
-    return runAll(config, cmd);
+    return runAll(config, pickCmd);
   }
-  if (cmd === 'switch' && /^\d+$/.test(opts.names[0] || '')) {
+  if (pickCmd === 'switch' && /^\d+$/.test(opts.names[0] || '')) {
     if (opts.names.length > 1) throw new Error('switch takes one name or port');
     return cliSwitch(config, Number(opts.names[0]), `port ${opts.names[0]}`);
   }
 
-  const entries = opts.names.length ? resolveNames(config, opts.names) : await pick(config, cmd);
-  if (cmd in ACTIONS) return runEach(cmd, entries);
+  const entries = opts.names.length ? resolveNames(config, opts.names) : await pick(config, pickCmd);
+  if (isAction(pickCmd)) return runEach(pickCmd, entries);
   if (entries.length > 1) throw new Error(`${cmd} takes one name`);
-  if (cmd === 'logs') return cliLogs(entries[0], opts);
-  if (cmd === 'switch') {
+  if (pickCmd === 'logs') return cliLogs(entries[0], opts);
+  if (pickCmd === 'switch') {
     if (entries[0].name === PROXY) throw new Error("can't switch the proxy to itself");
     return cliSwitch(config, entries[0].port, entries[0].name);
   }
@@ -521,9 +590,7 @@ async function main(argv) {
 
 if (require.main === module) {
   main(process.argv.slice(2)).catch((err) => {
-    console.error(`error: ${err.message}`);
+    console.error(`error: ${errMsg(err)}`);
     process.exit(1);
   });
 }
-
-module.exports = { PROXY, loadConfig, findEntry, getState, getPid, probe, start, stop, tail, logFile };
