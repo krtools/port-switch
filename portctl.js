@@ -56,7 +56,7 @@ even though their output goes to a log file (some tools need their own flag too)
 
 files: ${CONFIG_FILE}
        ${ENV_FILE}  (SWITCH_PASSWORD for the /switch page)
-       ${RUN_DIR}${path.sep}<name>.pid, <name>.log`,
+       ${RUN_DIR}${path.sep}<name>.pid, <name>.log (previous runs: <name>.log.1, .2, ...)`,
 
   status: `usage: portctl status [name...]
 
@@ -79,7 +79,8 @@ If one exits right away, the end of its log is printed.
   name...   one or more servers (or "${PROXY}"); picker if omitted
   --all     every server that is stopped (not the proxy)
 
-Output goes to run/<name>.log, which is cleared on each start.
+Output goes to run/<name>.log. The previous run's log is kept as run/<name>.log.1,
+the one before as .2, and so on, up to "logs": { "keep": N } in servers.json (default 5).
 Starting a server that's already running is not an error.`,
 
   stop: `usage: portctl stop [name...|--all]
@@ -123,6 +124,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function loadConfig() {
   const raw = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
   const proxy = { port: 3000, path: '/switch', ...raw.proxy };
+  const logs = { keep: 5, ...raw.logs };
+  if (!Number.isInteger(logs.keep) || logs.keep < 0 || logs.keep > 100) throw new Error('servers.json: logs.keep must be a whole number from 0 to 100');
   const names = new Set();
   const ports = new Set([proxy.port]);
   const servers = (raw.servers || []).map((s, i) => {
@@ -136,7 +139,7 @@ function loadConfig() {
     ports.add(s.port);
     return s;
   });
-  return { proxy, servers };
+  return { proxy, logs, servers };
 }
 
 function proxyEntry(config) {
@@ -245,6 +248,7 @@ async function start(entry) {
   if (!fs.existsSync(cwd)) throw new Error(`cwd does not exist: ${cwd}`);
 
   fs.mkdirSync(RUN_DIR, { recursive: true });
+  rotateLog(entry.name, loadConfig().logs.keep);
   fs.writeFileSync(logFile(entry.name), `# ${new Date().toISOString()}  (cwd ${cwd})\n$ ${entry.cmd}\n`);
   const log = fs.openSync(logFile(entry.name), 'a');
   const opts = {
@@ -265,6 +269,22 @@ async function start(entry) {
   child.unref();
   fs.writeFileSync(pidFile(entry.name), String(child.pid));
   return child.pid;
+}
+
+// Keep previous runs' logs: <name>.log -> .log.1 -> .log.2 ... up to `keep` (0 = just overwrite).
+function rotateLog(name, keep) {
+  const file = logFile(name);
+  if (!keep || !fs.existsSync(file)) return;
+  try {
+    fs.rmSync(`${file}.${keep}`, { force: true });
+    for (let i = keep - 1; i >= 1; i--) {
+      if (fs.existsSync(`${file}.${i}`)) fs.renameSync(`${file}.${i}`, `${file}.${i + 1}`);
+    }
+    fs.renameSync(file, `${file}.1`);
+  } catch (err) {
+    // e.g. Windows, where a leftover process may still hold the file open; it gets overwritten instead
+    console.error(`warning: couldn't keep the previous log for ${name}: ${err.message}`);
+  }
 }
 
 // Kill the whole tree: the pid is the shell, and e.g. `npm run dev` puts the real server in a child.
