@@ -233,6 +233,9 @@ const STYLE = `
   .btn.danger { color:var(--danger); } .btn.danger:hover { background:var(--danger-tint); border-color:var(--danger); }
   .btn.ghost { background:transparent; border-color:transparent; color:var(--mute); } .btn.ghost:hover { background:var(--chip); color:var(--fg); }
   .btn.icon { padding:0 7px; } .btn.wide { width:100%; height:34px; }
+  .btn.sm { height:26px; padding:0 9px; gap:5px; font-size:12px; } .btn.sm.icon { padding:0 5px; }
+  .btn:disabled { opacity:.4; cursor:default; pointer-events:none; }
+  .swap { display:inline-grid; } .swap > * { grid-area:1/1; } .swap > .reserve { visibility:hidden; } /* width of the wider label, so Start/Restart don't shift the row */
   .btn[aria-pressed=true] { color:var(--acc); border-color:var(--acc); background:var(--acc-tint); }
   .pill { display:inline-flex; align-items:center; gap:6px; height:22px; padding:0 9px; border-radius:999px; font-size:12px; font-weight:500; white-space:nowrap; }
   .pill i { width:6px; height:6px; border-radius:50%; background:currentColor; }
@@ -241,7 +244,6 @@ const STYLE = `
   .pill.off { background:var(--off-bg); color:var(--off-fg); } .pill.off i { background:var(--off-dot); }
   .pill.ext { background:var(--ext-bg); color:var(--ext-fg); } .pill.ext i { background:var(--ext-dot); }
   .pill.danger { background:var(--danger-tint); color:var(--danger); }
-  .pill.accent { background:var(--acc); color:#fff; }
   .list { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
   .row { position:relative; display:flex; align-items:center; gap:8px; padding:10px 12px 10px 14px; border-top:1px solid var(--line); }
   .row:first-child { border-top:0; } .row:not(.active):hover { background:var(--hover); }
@@ -249,6 +251,10 @@ const STYLE = `
   .row .main { flex:1; min-width:0; display:flex; flex-direction:column; color:inherit; }
   .row .main::after { content:""; position:absolute; inset:0; } /* the whole row switches */
   .row .main:hover { text-decoration:none; } .row:hover .name { color:var(--acc); }
+  .dot { flex:none; align-self:flex-start; width:8px; height:8px; margin:6px 2px 0 0; border-radius:50%; } /* centered on the name line */
+  .dot.ok { background:var(--ok-dot); } .dot.warn { background:var(--warn-dot); animation:pulse 1.2s ease-in-out infinite; }
+  .dot.off { background:var(--off-dot); } .dot.ext { background:var(--ext-dot); } .dot.none { visibility:hidden; }
+  @keyframes pulse { 50% { opacity:.35; } } @media (prefers-reduced-motion:reduce) { .dot.warn { animation:none; } }
   .name { font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .port { font-size:12px; color:var(--mute); }
   .actions { position:relative; z-index:1; display:flex; flex-wrap:wrap; justify-content:flex-end; align-items:center; gap:6px; pointer-events:none; }
   .actions a, .actions form { pointer-events:auto; } /* pills and gaps click through to the row */
@@ -306,13 +312,23 @@ type Action = 'start' | 'stop' | 'restart';
 const ACTIONS: readonly Action[] = ['start', 'stop', 'restart'];
 const ACTION_STYLE: Record<Action, string> = { start: 'primary', restart: '', stop: 'danger' };
 
-const actionButton = (action: Action, name: string, label = action[0].toUpperCase() + action.slice(1)) =>
+const actionLabel = (action: Action) => action[0].toUpperCase() + action.slice(1);
+const actionButton = (action: Action, name: string, label = actionLabel(action)) =>
   `<form method="post" action="${SWITCH_PATH}/${action}/${encodeURIComponent(name)}"><button class="btn ${ACTION_STYLE[action]}">${icon(action, 14)}${esc(label)}</button></form>`;
 
-const STATE_PILL: Record<State, [string, string]> = {
-  running: ['ok', 'Running'], starting: ['warn', 'Starting'], stopped: ['off', 'Stopped'], external: ['ext', 'External'],
+/** Compact row button. `reserve` sizes it to fit another action's label too, so swapping
+ *  Start <-> Restart keeps the width; `disabled` keeps the slot when the action doesn't apply. */
+const rowButton = (action: Action, name: string, { reserve, disabled = false }: { reserve?: Action; disabled?: boolean } = {}) => {
+  const label = (a: Action, cls = '') => `<span${cls ? ` class="${cls}" aria-hidden="true"` : ''}>${actionLabel(a)}</span>`;
+  const text = reserve ? `<span class="swap">${label(action)}${label(reserve, 'reserve')}</span>` : actionLabel(action);
+  return `<form method="post" action="${SWITCH_PATH}/${action}/${encodeURIComponent(name)}">` +
+    `<button class="btn sm ${ACTION_STYLE[action]}"${disabled ? ' disabled' : ''}>${icon(action, 13)}${text}</button></form>`;
 };
-const statePill = (state: State) => `<span class="pill ${STATE_PILL[state][0]}" title="${STATE_PILL[state][1].toLowerCase()}"><i></i>${STATE_PILL[state][1]}</span>`;
+
+const STATE_DOT: Record<State, [string, string]> = {
+  running: ['ok', 'Running'], starting: ['warn', 'Starting'], stopped: ['off', 'Stopped'], external: ['ext', 'Running outside portctl'],
+};
+const stateDot = (state: State) => `<span class="dot ${STATE_DOT[state][0]}" role="img" title="${STATE_DOT[state][1]}" aria-label="${STATE_DOT[state][1]}"></span>`;
 
 async function renderSwitchPage(res: Res, msg: string | null): Promise<void> {
   reloadConfig();
@@ -325,23 +341,27 @@ async function renderSwitchPage(res: Res, msg: string | null): Promise<void> {
   const rows = entries.map((e, i) => {
     const { state } = states[i];
     const active = e.port === target;
-    const buttons = e.unregistered || !e.cmd ? '' : state === 'running' || state === 'starting'
-      ? actionButton('restart', e.name) + actionButton('stop', e.name)
-      : state === 'stopped' ? actionButton('start', e.name) : '';
+    // Same controls in every state, so the row never reflows: [logs] [Start|Restart] [Stop].
+    // External servers weren't started by portctl, so neither button applies to them.
+    const up = state === 'running' || state === 'starting';
+    const buttons = e.unregistered || !e.cmd ? ''
+      : rowButton(up ? 'restart' : 'start', e.name, { reserve: up ? 'start' : 'restart', disabled: state === 'external' })
+        + rowButton('stop', e.name, { disabled: !up });
     const log = e.unregistered || !e.cmd ? ''
-      : `<a class="btn ghost icon" href="${SWITCH_PATH}/log/${encodeURIComponent(e.name)}" title="Logs" aria-label="${esc(e.name)} logs">${icon('logs')}</a>`;
+      : `<a class="btn sm ghost" href="${SWITCH_PATH}/log/${encodeURIComponent(e.name)}" aria-label="${esc(e.name)} logs">${icon('logs', 13)}Logs</a>`;
     return `<div class="row${active ? ' active' : ''}">
-      <a class="main" href="${SWITCH_PATH}/${e.port}" title="Switch to ${esc(e.name)}">
+      ${stateDot(state)}
+      <a class="main" href="${SWITCH_PATH}/${e.port}" title="Switch to ${esc(e.name)}"${active ? ' aria-current="true"' : ''}>
         <span class="name">${esc(e.name)}</span><span class="port mono">:${e.port}</span>
       </a>
-      <div class="actions">${active ? '<span class="pill accent">Active</span>' : ''}${statePill(state)}${log}${buttons}</div>
+      <div class="actions">${log}${buttons}</div>
     </div>`;
   }).join('');
   const noneRow = `<div class="row${target === null ? ' active' : ''}">
-      <a class="main" href="${SWITCH_PATH}/none" title="Stop proxying, show visitors a placeholder page">
+      <span class="dot none"></span>
+      <a class="main" href="${SWITCH_PATH}/none" title="Stop proxying, show visitors a placeholder page"${target === null ? ' aria-current="true"' : ''}>
         <span class="name">None</span><span class="port">Nothing served</span>
       </a>
-      <div class="actions">${target === null ? '<span class="pill accent">Active</span>' : ''}</div>
     </div>`;
 
   const custom = ALLOW_UNREGISTERED ? `
