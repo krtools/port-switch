@@ -251,9 +251,12 @@ const STYLE = `
   .row .main { flex:1; min-width:0; display:flex; flex-direction:column; color:inherit; }
   .row .main::after { content:""; position:absolute; inset:0; } /* the whole row switches */
   .row .main:hover { text-decoration:none; } .row:hover .name { color:var(--acc); }
-  .dot { flex:none; align-self:flex-start; width:8px; height:8px; margin:6px 2px 0 0; border-radius:50%; } /* centered on the name line */
-  .dot.ok { background:var(--ok-dot); } .dot.warn { background:var(--warn-dot); animation:pulse 1.2s ease-in-out infinite; }
-  .dot.off { background:var(--off-dot); } .dot.ext { background:var(--ext-dot); } .dot.none { visibility:hidden; }
+  /* The dot sits in a line box like the name's, so vertical-align:middle centers it on the
+     name's lowercase letters (baseline + half the x-height) in whatever font is in use. */
+  .dot { flex:none; align-self:flex-start; margin-right:2px; }
+  .dot::before { content:""; display:inline-block; width:8px; height:8px; border-radius:50%; background:currentColor; vertical-align:middle; }
+  .dot.ok { color:var(--ok-dot); } .dot.warn { color:var(--warn-dot); animation:pulse 1.2s ease-in-out infinite; }
+  .dot.off { color:var(--off-dot); } .dot.ext { color:var(--ext-dot); } .dot.none { visibility:hidden; }
   @keyframes pulse { 50% { opacity:.35; } } @media (prefers-reduced-motion:reduce) { .dot.warn { animation:none; } }
   .name { font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .port { font-size:12px; color:var(--mute); }
   .actions { position:relative; z-index:1; display:flex; flex-wrap:wrap; justify-content:flex-end; align-items:center; gap:6px; pointer-events:none; }
