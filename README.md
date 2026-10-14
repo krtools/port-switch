@@ -11,6 +11,7 @@ browser ──https──> outer proxy ──> :3000 port-switch ──> :3001 a
 ```
 
 - **Switch page** at `/switch`: pick the active server, start/stop/restart servers, open their logs. Password-protected.
+- **None**: switch to nothing without stopping the proxy; visitors get a "nothing is being served" page.
 - **Everything else** on the port goes to the active server, WebSockets included (HMR works).
 - **Live log viewer** in the browser, with terminal colors, per server or all combined.
 - **`portctl`**: start/stop/restart/status/logs from the command line, servers run detached and survive logout.
@@ -50,7 +51,7 @@ To upgrade, extract a newer archive over the same folder. Archives never contain
 | `proxy.port` | default `3000` | port the proxy listens on |
 | `proxy.path` | default `/switch` | where the switch page and its endpoints live (change it if an app uses `/switch`) |
 | `logs.keep` | default `5` | previous runs' logs to keep per server (`0` = overwrite on each start) |
-| `servers[].name` | required | letters, digits, `_ . -`; `proxy`, `self` and `all` are reserved |
+| `servers[].name` | required | letters, digits, `_ . -`; `proxy`, `self`, `all` and `none` are reserved |
 | `servers[].port` | required | where the server listens |
 | `servers[].cmd` | optional | shell command that starts it; without it the server can be switched to but not started |
 | `servers[].cwd` | optional | working directory; `~` and paths relative to `servers.json`'s folder work |
@@ -80,7 +81,7 @@ run/<name>.log, <name>.log.1, .2, ...   current and previous runs
 
 Restart the proxy after changing `.env` (`portctl restart proxy`). Changing the password logs out every browser. Values from `.env` are not passed to your servers.
 
-The proxy also reads `PORT`, `HOST` (default `0.0.0.0`) and `TARGET` (initially active port) from the environment.
+The proxy also reads `PORT`, `HOST` (default `0.0.0.0`) and `TARGET` (initially active port, or `none`) from the environment.
 
 ## portctl
 
@@ -91,7 +92,7 @@ portctl stop    [name...|--all]
 portctl restart [name...|--all]
 portctl status  [name...]        exit code 3 if a named server isn't running
 portctl logs    [name] [-n N] [--no-follow] [--strip]
-portctl switch  [name|port]      point the running proxy at a server
+portctl switch  [name|port|none] point the running proxy at a server (none: serve nothing)
 portctl help    [command]        or: portctl <command> --help
 ```
 
@@ -116,6 +117,7 @@ Log in once at `/switch`; the cookie lasts a year (it's HttpOnly, scoped to `/sw
 |---|---|
 | `GET /switch` | server list with status, start/stop/restart buttons, log links |
 | `GET /switch/{port}` | make that port active, then redirect to `/` (any port, registered or not) |
+| `GET /switch/none` | serve nothing: every request gets a placeholder page (503), WebSockets a 503 |
 | `POST /switch/{start,stop,restart}/{name}` | |
 | `GET /switch/log/{name}` | live log viewer; `?lines=N` history (default 1000, max 5000), `?raw` plain text |
 | `GET /switch/logs` | every server's log combined (50 lines each by default) |

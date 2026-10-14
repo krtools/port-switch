@@ -30,7 +30,8 @@ const HOME_DIR = path.dirname(CONFIG_FILE);
 const RUN_DIR = path.join(HOME_DIR, 'run');
 const ENV_FILE = path.join(HOME_DIR, '.env');
 export const PROXY = 'proxy'; // the proxy itself (switch.js); --self is an alias
-const RESERVED = new Set([PROXY, 'self', 'all']);
+const NONE = 'none'; // `portctl switch none`: the proxy serves a placeholder page instead of a server
+const RESERVED = new Set([PROXY, 'self', 'all', NONE]);
 
 export interface ServerEntry {
   name: string;
@@ -82,7 +83,7 @@ commands:
   restart [name...|--all]         restart servers (starts them if stopped)
   logs    [name] [-n N] [--no-follow] [--strip]
                                   show and follow a server's log
-  switch  [name|port]             point the running proxy at a server
+  switch  [name|port|none]        point the running proxy at a server (none: serve nothing)
   help    [command]               help for a command (or: portctl <command> --help)
 
 Commands that take names show a picker when no name is given.
@@ -148,10 +149,13 @@ Print the end of run/<name>.log and keep following it (Ctrl+C to quit).
   --no-follow    print and exit
   --strip        remove terminal color/escape codes (for grep, less, files)`,
 
-  switch: `usage: portctl switch [name|port]
+  switch: `usage: portctl switch [name|port|none]
 
 Point the running proxy at a server (same as visiting /switch/<port>).
-Any port works, registered or not. Picker if omitted.`,
+Any port works, registered or not. Picker if omitted.
+
+"none" stops proxying without stopping the proxy: visitors get a page saying
+nothing is being served (and WebSockets a 503) until you switch to a server again.`,
 
   help: `usage: portctl help [command]
 
@@ -294,7 +298,7 @@ function proxyRequest(config: Config, urlPath: string): Promise<{ status: number
   });
 }
 
-async function proxyState(config: Config): Promise<{ target: number; name: string } | null> {
+async function proxyState(config: Config): Promise<{ target: number | null; name: string } | null> {
   try {
     const res = await proxyRequest(config, `${config.proxy.path}/api/state`);
     return res.status === 200 ? JSON.parse(res.body) : null;
@@ -460,7 +464,7 @@ async function cliStatus(config: Config, named: ServerEntry[]): Promise<void> {
   const [states, ps] = await Promise.all([Promise.all(entries.map(getState)), proxyState(config)]);
   const rows = entries.map((e, i) => {
     const s = states[i];
-    const note = e.name === PROXY ? (ps ? `-> ${ps.name} (:${ps.target})` : '')
+    const note = e.name === PROXY ? (!ps ? '' : ps.target === null ? '-> none (not proxying)' : `-> ${ps.name} (:${ps.target})`)
       : ps?.target === e.port ? '* active'
         : s.state === 'external' ? '(port in use, not ours)' : '';
     return [e.name, e.port, s.state, s.pid || '-', s.pid ? uptime(e.name) : '-', note];
@@ -510,17 +514,18 @@ function cliLogs(entry: ServerEntry, { lines, follow, strip }: Options): void {
   });
 }
 
-async function cliSwitch(config: Config, port: number, label: string): Promise<void> {
+/** Point the proxy at a port, or at nothing (null = "none"). */
+async function cliSwitch(config: Config, port: number | null, label: string): Promise<void> {
   let res;
   try {
-    res = await proxyRequest(config, `${config.proxy.path}/${port}`);
+    res = await proxyRequest(config, `${config.proxy.path}/${port ?? NONE}`);
   } catch {
     throw new Error(`the proxy isn't answering on :${config.proxy.port} (portctl start ${PROXY})`);
   }
   if (res.status === 401) throw new Error(`proxy rejected the password: check SWITCH_PASSWORD in ${ENV_FILE} (restart the proxy after changing it)`);
   if (res.status === 503) throw new Error(`the proxy has no SWITCH_PASSWORD: set it in ${ENV_FILE} and run portctl restart ${PROXY}`);
   if (res.status !== 302) throw new Error(`proxy refused: ${res.body.trim()}`);
-  console.log(`proxy -> ${label} (:${port})`);
+  console.log(port === null ? 'proxy -> none (visitors see a "nothing is being served" page)' : `proxy -> ${label} (:${port})`);
 }
 
 type Candidate = { e: ServerEntry; s: ServerState };
@@ -536,10 +541,13 @@ async function pick(config: Config, cmd: PickCmd): Promise<ServerEntry[]> {
   const all = [...config.servers, proxyEntry(config)];
   const states = await Promise.all(all.map(getState));
   const list = all.map((e, i) => ({ e, s: states[i] })).filter(PICK_FILTERS[cmd]);
+  // "none" heads the switch picker, like on the switch page
+  if (cmd === 'switch') list.unshift({ e: { name: NONE, port: 0 }, s: { pid: null, up: false, state: 'stopped' } });
   if (!list.length) throw new Error(`nothing to ${cmd}`);
 
   const multi = isAction(cmd);
-  list.forEach(({ e, s }, i) => console.log(`  ${String(i + 1).padStart(2)}) ${e.name}  :${e.port}  [${s.state}]`));
+  list.forEach(({ e, s }, i) => console.log(`  ${String(i + 1).padStart(2)}) ${e.name === NONE && cmd === 'switch'
+    ? 'none  (stop proxying, show a placeholder page)' : `${e.name}  :${e.port}  [${s.state}]`}`));
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const answer = await new Promise<string>((r) => rl.question(`${cmd} which?${multi ? ' (space-separated for several)' : ''} `, r));
   rl.close();
@@ -609,8 +617,9 @@ async function main(argv: string[]): Promise<void> {
     if (opts.names.length) throw new Error('give names or --all, not both');
     return runAll(config, pickCmd);
   }
-  if (pickCmd === 'switch' && /^\d+$/.test(opts.names[0] || '')) {
+  if (pickCmd === 'switch' && (/^\d+$/.test(opts.names[0] || '') || opts.names[0] === NONE)) {
     if (opts.names.length > 1) throw new Error('switch takes one name or port');
+    if (opts.names[0] === NONE) return cliSwitch(config, null, NONE);
     return cliSwitch(config, Number(opts.names[0]), `port ${opts.names[0]}`);
   }
 
@@ -620,6 +629,7 @@ async function main(argv: string[]): Promise<void> {
   if (pickCmd === 'logs') return cliLogs(entries[0], opts);
   if (pickCmd === 'switch') {
     if (entries[0].name === PROXY) throw new Error("can't switch the proxy to itself");
+    if (entries[0].name === NONE) return cliSwitch(config, null, NONE); // picked from the list
     return cliSwitch(config, entries[0].port, entries[0].name);
   }
 }

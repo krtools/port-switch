@@ -4,10 +4,11 @@
 //
 //   GET  /switch                -> page listing servers from servers.json (status, start/stop)
 //   GET  /switch/{port}         -> make {port} the active target, redirect to /
+//   GET  /switch/none           -> proxy nothing: visitors get a placeholder page (503)
 //   POST /switch/{start|stop|restart}/{name}
 //   GET  /switch/log/{name}     -> live log viewer (?raw: plain-text tail), /stream: SSE
 //   GET  /switch/logs           -> every server's log combined, /stream: SSE
-//   GET  /switch/api/state      -> {"target":3001,"name":"..."} (used by portctl)
+//   GET  /switch/api/state      -> {"target":3001 or null,"name":"..."} (used by portctl)
 //   GET|POST /switch/login, GET /switch/logout
 //   anything else               -> proxied to the active target (incl. WebSockets)
 // (/switch is proxy.path in servers.json)
@@ -16,7 +17,7 @@
 // for a long-lived cookie, or send "Authorization: Bearer <password>" (portctl does).
 //
 // Usage: node switch.js [--config servers.json]   or   portctl start proxy
-// env: PORT_SWITCH_CONFIG PORT HOST TARGET SWITCH_PASSWORD SWITCH_COOKIE_DAYS (default 365) SWITCH_COOKIE_DOMAIN
+// env: PORT_SWITCH_CONFIG PORT HOST TARGET (a port or "none") SWITCH_PASSWORD SWITCH_COOKIE_DAYS (default 365) SWITCH_COOKIE_DOMAIN
 
 import * as http from 'http';
 import * as net from 'net';
@@ -70,14 +71,16 @@ const SWITCH_PATH = config.proxy.path;
 const LISTEN_PORT = Number(process.env.PORT) || config.proxy.port;
 const LISTEN_HOST = process.env.HOST || '0.0.0.0';
 
-let target = Number(process.env.TARGET) || config.servers[0]?.port || 3001;
+// The port being proxied to, or null for "None": every request gets the idle page.
+let target: number | null = process.env.TARGET === 'none' ? null : Number(process.env.TARGET) || config.servers[0]?.port || 3001;
 
 // Open WebSocket tunnels, killed on switch so clients (e.g. HMR) reconnect to the new target.
 const tunnels = new Set<Duplex>();
 
 const esc = (s: unknown) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const entryOf = (port: number) => config.servers.find((s) => s.port === port);
-const nameOf = (port: number) => entryOf(port)?.name || `port ${port}`;
+const nameOf = (port: number | null) => (port === null ? 'none' : entryOf(port)?.name || `port ${port}`);
+const describe = (port: number | null) => (port === null ? 'none' : `:${port} (${nameOf(port)})`);
 
 // ---- auth ------------------------------------------------------------------
 // Cookie = "<expiry>.<HMAC(password, expiry)>": nothing stored server-side, and
@@ -272,6 +275,7 @@ const ICONS = {
   restart: '<path d="M20 11A8.1 8.1 0 0 0 4.5 9M4 5v4h4"/><path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
   back: '<path d="M5 12h14M5 12l6 6M5 12l6-6"/>',
+  power: '<path d="M7 6a7.75 7.75 0 1 0 10 0"/><path d="M12 4v8"/>',
   unplug: '<path d="M7 12l5 5-1.5 1.5a3.5 3.5 0 1 1-5-5L7 12zM17 12l-5-5 1.5-1.5a3.5 3.5 0 1 1 5 5L17 12zM3 21l2.5-2.5M18.5 5.5 21 3M10 11l-2 2M13 14l-2 2"/>',
 };
 type IconName = keyof typeof ICONS;
@@ -312,7 +316,7 @@ const statePill = (state: State) => `<span class="pill ${STATE_PILL[state][0]}" 
 
 async function renderSwitchPage(res: Res, msg: string | null): Promise<void> {
   reloadConfig();
-  const ports = [...new Set([...config.servers.map((s) => s.port), target])];
+  const ports = [...new Set([...config.servers.map((s) => s.port), ...(target === null ? [] : [target])])];
   const entries = ports.map((port): ServerEntry & { unregistered?: boolean } =>
     entryOf(port) || { name: `port ${port}`, port, unregistered: true });
   const states = await Promise.all(entries.map((e): Promise<{ state: State }> =>
@@ -333,6 +337,12 @@ async function renderSwitchPage(res: Res, msg: string | null): Promise<void> {
       <div class="actions">${active ? '<span class="pill accent">Active</span>' : ''}${statePill(state)}${log}${buttons}</div>
     </div>`;
   }).join('');
+  const noneRow = `<div class="row${target === null ? ' active' : ''}">
+      <a class="main" href="${SWITCH_PATH}/none" title="Stop proxying, show visitors a placeholder page">
+        <span class="name">None</span><span class="port">Nothing served</span>
+      </a>
+      <div class="actions">${target === null ? '<span class="pill accent">Active</span>' : ''}</div>
+    </div>`;
 
   const custom = ALLOW_UNREGISTERED ? `
     <form class="other" onsubmit="location.href='${SWITCH_PATH}/'+this.p.value;return false">
@@ -347,26 +357,42 @@ async function renderSwitchPage(res: Res, msg: string | null): Promise<void> {
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
   res.end(page('Servers', `
 <h1>Servers</h1>
-<p class="sub">Proxying to <b>${esc(nameOf(target))}</b> <span class="mono">:${target}</span></p>
+<p class="sub">${target === null ? 'Not proxying anything: visitors see a placeholder page'
+    : `Proxying to <b>${esc(nameOf(target))}</b> <span class="mono">:${target}</span>`}</p>
 ${errors.map((m) => `<p class="msg">${esc(m)}</p>`).join('')}
-<div class="list">${rows}</div>${custom}`, { head, nav: true }));
+<div class="list">${noneRow}${rows}</div>${custom}`, { head, nav: true }));
 }
 
-function doSwitch(port: number, res: Res): void {
-  const known = config.servers.some((s) => s.port === port);
-  if (!(port > 0 && port < 65536) || port === LISTEN_PORT || (!known && !ALLOW_UNREGISTERED)) {
-    res.writeHead(400, { 'content-type': 'text/plain' });
-    res.end(`Not allowed: ${port}\n`);
-    return;
+/** Switch to a port, or to null ("None"). Responds with a redirect: to the site for a port,
+ *  back to the switch page for None. */
+function doSwitch(port: number | null, res: Res): void {
+  if (port !== null) {
+    const known = config.servers.some((s) => s.port === port);
+    if (!(port > 0 && port < 65536) || port === LISTEN_PORT || (!known && !ALLOW_UNREGISTERED)) {
+      res.writeHead(400, { 'content-type': 'text/plain' });
+      res.end(`Not allowed: ${port}\n`);
+      return;
+    }
   }
   if (port !== target) {
-    console.log(`[switch] ${target} -> ${port} (${nameOf(port)})`);
+    console.log(`[switch] ${describe(target)} -> ${describe(port)}`);
     target = port;
     for (const s of tunnels) s.destroy();
     tunnels.clear();
   }
-  res.writeHead(302, { location: '/', 'cache-control': 'no-store' });
+  res.writeHead(302, { location: port === null ? SWITCH_PATH : '/', 'cache-control': 'no-store' });
   res.end();
+}
+
+// What visitors get while "None" is selected.
+function renderIdle(res: Res): void {
+  res.writeHead(503, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+  res.end(page('Nothing served', `<div class="card">
+  <span class="badge" style="background:var(--chip);color:var(--mute)">${icon('power', 18)}</span>
+  <h1>Nothing is being served right now</h1>
+  <p class="sub">This address isn't pointed at a server at the moment.</p>
+  <div class="buttons"><a class="btn" href="${SWITCH_PATH}">Choose a server</a></div>
+</div>`));
 }
 
 async function doAction(action: Action, name: string, res: Res): Promise<void> {
@@ -698,6 +724,7 @@ const hasBody = (req: Req) => !!req.headers['transfer-encoding'] || Number(req.h
 
 function proxy(req: Req, res: Res, retry = true): void {
   const port = target;
+  if (port === null) { req.resume(); renderIdle(res); return; }
   const up = http.request({
     host: UPSTREAM_HOST, port, method: req.method, path: req.url,
     headers: upstreamHeaders(req, port),
@@ -735,6 +762,7 @@ async function handleSwitch(req: Req, res: Res, urlPath: string, query: string):
   let parts: string[] = [];
   try { parts = urlPath.slice(SWITCH_PATH.length + 1).split('/').filter(Boolean).map(decodeURIComponent); } catch {}
   if (parts.length === 1 && /^\d+$/.test(parts[0])) return doSwitch(Number(parts[0]), res);
+  if (parts.length === 1 && parts[0] === 'none') return doSwitch(null, res);
   if (parts.length === 2 && req.method === 'POST' && (ACTIONS as readonly string[]).includes(parts[0])) {
     req.resume();
     return doAction(parts[0] as Action, parts[1], res);
@@ -779,6 +807,11 @@ const server = http.createServer((req, res) => {
 // WebSocket / any Upgrade: raw TCP tunnel to the active target.
 server.on('upgrade', (req: Req, socket: Duplex, head: Buffer) => {
   const port = target;
+  if (port === null) { // "None": nothing to connect to
+    socket.on('error', () => {});
+    socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    return;
+  }
   let connected = false;
   const up = net.connect(port, UPSTREAM_HOST, () => {
     connected = true;
@@ -823,6 +856,6 @@ server.on('clientError', (err: NodeJS.ErrnoException, socket: Duplex) => {
 });
 
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
-  console.log(`[port-switch] listening on ${LISTEN_HOST}:${LISTEN_PORT} -> :${target} (${nameOf(target)})`);
+  console.log(`[port-switch] listening on ${LISTEN_HOST}:${LISTEN_PORT} -> ${describe(target)}`);
   console.log(`[port-switch] switch page: http://localhost:${LISTEN_PORT}${SWITCH_PATH}`);
 });
