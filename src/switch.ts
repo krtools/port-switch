@@ -413,8 +413,7 @@ function renderIdle(res: Res): void {
   res.end(page('Nothing served', `<div class="card">
   <span class="badge" style="background:var(--chip);color:var(--mute)">${icon('power', 18)}</span>
   <h1>Nothing is being served right now</h1>
-  <p class="sub">This address isn't pointed at a server at the moment.</p>
-  <div class="buttons"><a class="btn" href="${SWITCH_PATH}">Choose a server</a></div>
+  <p class="sub" style="margin:0">This address isn't pointed at a server at the moment.</p>
 </div>`));
 }
 
