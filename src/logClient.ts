@@ -198,16 +198,16 @@ export function logClient(opts: LogClientOptions): void {
 
   const conn = document.getElementById('conn') as HTMLElement;
   const connText = document.getElementById('conn-text') as HTMLElement;
-  const setConn = (cls: string, text: string) => { conn.className = `conn ${cls}`; connText.textContent = text; };
+  const setConn = (cls: string, text: string) => { conn.className = `pill ${cls}`; connText.textContent = text; };
   const source = new EventSource(opts.streamUrl);
   source.onmessage = (e) => receive('message', e);
   for (const type of ['reset', 'run', 'notice'] as const) {
     source.addEventListener(type, (e) => receive(type, e as MessageEvent<string>));
   }
-  source.onopen = () => setConn('live', 'live');
+  source.onopen = () => setConn('ok', 'Live');
   source.onerror = () => {
-    if (source.readyState === EventSource.CLOSED) setConn('dead', 'disconnected (reload, or log in again)');
-    else setConn('wait', 'reconnecting');
+    if (source.readyState === EventSource.CLOSED) setConn('danger', 'Disconnected: reload, or log in again');
+    else setConn('warn', 'Reconnecting');
   };
 
   const pauseBtn = document.getElementById('pause') as HTMLButtonElement;

@@ -134,15 +134,16 @@ const safeNext = (next: string | null | undefined): string =>
 
 function renderLogin(res: Res, status: number, next: string, msg?: string): void {
   res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-  res.end(page('Log in', `
-<h1>Switch server</h1>
-<p>Password required.</p>
-${msg ? `<p class="msg">${esc(msg)}</p>` : ''}
-<form class="custom" method="post" action="${SWITCH_PATH}/login">
-  <input type="hidden" name="next" value="${esc(next)}">
-  <input type="password" name="password" autocomplete="current-password" placeholder="password" autofocus required>
-  <button>Log in</button>
-</form>`));
+  res.end(page('Log in', `<div class="card">
+  <div style="margin-bottom:20px">${brand()}</div>
+  ${msg ? `<p class="msg">${esc(msg)}</p>` : ''}
+  <form method="post" action="${SWITCH_PATH}/login">
+    <input type="hidden" name="next" value="${esc(next)}">
+    <label class="label" for="password">Password</label>
+    <input id="password" type="password" name="password" autocomplete="current-password" style="width:100%" autofocus required>
+    <button class="btn primary wide" style="margin-top:14px">Log in</button>
+  </form>
+</div>`));
 }
 
 function readBody(req: Req, limit = 4096): Promise<string> {
@@ -196,34 +197,118 @@ async function guard(req: Req, res: Res, urlPath: string): Promise<boolean> {
 
 // ---- switch UI -------------------------------------------------------------
 const STYLE = `
-  :root { color-scheme: light dark; --bg:#f6f6f4; --card:#fff; --fg:#1b1b1b; --mute:#777; --line:#e2e2de; --acc:#2a6ef0; --err:#c0392b; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#151515; --card:#1f1f1f; --fg:#eee; --mute:#999; --line:#333; --acc:#6d9cff; --err:#ff7b6b; } }
-  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui,sans-serif; }
-  main { max-width:520px; margin:48px auto; padding:0 16px; }
-  h1 { font-size:18px; margin:0 0 4px; } p { color:var(--mute); margin:0 0 16px; }
-  .msg { color:var(--err); background:var(--card); border:1px solid var(--err); border-radius:8px; padding:10px 14px; white-space:pre-wrap; }
-  .row { display:flex; align-items:center; gap:10px; padding:0 10px 0 0; background:var(--card);
-         border:1px solid var(--line); border-radius:8px; margin-bottom:8px; }
-  .row:hover { border-color:var(--acc); } .row.active { border-color:var(--acc); box-shadow:0 0 0 1px var(--acc); }
-  .main { flex:1; display:flex; align-items:center; gap:10px; padding:12px 0 12px 14px; color:inherit; text-decoration:none; min-width:0; }
-  .dot { width:9px; height:9px; border-radius:50%; flex:none; }
-  .running, .external { background:#2bb24c; } .starting { background:#e0a020; } .stopped { background:#888; }
-  .name { flex:1; font-weight:500; overflow:hidden; text-overflow:ellipsis; } .port { color:var(--mute); font-family:ui-monospace,monospace; }
-  .tag { font-size:12px; color:var(--acc); } .state { font-size:12px; color:var(--mute); }
-  .row form { margin:0; } .row a.log { font-size:12px; color:var(--mute); }
-  form.custom { display:flex; gap:8px; margin-top:16px; }
-  input, button { font:inherit; padding:6px 10px; border-radius:6px; border:1px solid var(--line); background:var(--card); color:inherit; }
-  input { flex:1; } button { cursor:pointer; } button:hover { border-color:var(--acc); }`;
+  :root { color-scheme: light dark;
+    --bg:#f4f5f7; --card:#fff; --hover:#f8f9fb; --line:#e3e5e8; --line-strong:#cdd1d8; --fg:#111827; --mute:#6b7280; --chip:#eef0f3;
+    --acc:#4f6ef7; --acc-hover:#3f5ce0; --acc-tint:#eef1ff; --ring:0 0 0 3px rgba(79,110,247,.28);
+    --danger:#c93c37; --danger-tint:#fdecec;
+    --ok-bg:#e3f6ea; --ok-fg:#17703b; --ok-dot:#22a55a; --warn-bg:#fdf3dc; --warn-fg:#8a5a00; --warn-dot:#d99a14;
+    --off-bg:#eef0f3; --off-fg:#4b5563; --off-dot:#9aa1ab; --ext-bg:#e8f0fe; --ext-fg:#1d4fb8; --ext-dot:#3b7be8; }
+  @media (prefers-color-scheme: dark) { :root {
+    --bg:#0f1115; --card:#171a20; --hover:#1b1f26; --line:#262a33; --line-strong:#363b46; --fg:#e6e8eb; --mute:#8b919c; --chip:#262a33;
+    --acc:#6d86ff; --acc-hover:#8398ff; --acc-tint:#1c2340; --ring:0 0 0 3px rgba(109,134,255,.35);
+    --danger:#ff7a72; --danger-tint:#3a1d1f;
+    --ok-bg:#14301f; --ok-fg:#7ee2a1; --ok-dot:#3ccf74; --warn-bg:#33270c; --warn-fg:#f2c45a; --warn-dot:#e0a52a;
+    --off-bg:#23272f; --off-fg:#a3a9b3; --off-dot:#6b7280; --ext-bg:#162845; --ext-fg:#8db4ff; --ext-dot:#5b93f5; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); -webkit-font-smoothing:antialiased;
+         font:14px/1.45 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; font-variant-numeric:tabular-nums; }
+  a { color:var(--acc); text-decoration:none; } a:hover { text-decoration:underline; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  .ic { flex:none; }
+  :focus-visible { outline:none; box-shadow:var(--ring); }
+  h1 { font-size:20px; font-weight:600; letter-spacing:-.01em; margin:0 0 2px; }
+  .sub { color:var(--mute); font-size:13px; margin:0 0 18px; } .sub b { color:var(--fg); font-weight:500; }
+  .topbar { display:flex; flex-wrap:wrap; align-items:center; gap:6px 8px; padding:10px 16px; background:var(--card); border-bottom:1px solid var(--line); }
+  .topbar nav { margin-left:auto; display:flex; flex-wrap:wrap; gap:2px; }
+  .brand { display:inline-flex; align-items:center; gap:10px; color:var(--fg); font-weight:600; } .brand:hover { text-decoration:none; }
+  .mark { width:24px; height:24px; border-radius:6px; background:var(--acc); color:#fff; display:inline-flex; align-items:center; justify-content:center; }
+  main { max-width:600px; margin:0 auto; padding:28px 16px 48px; }
+  .btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; height:30px; padding:0 12px; border-radius:6px;
+         border:1px solid var(--line); background:var(--card); color:var(--fg); font-family:inherit; font-size:13px; font-weight:500; line-height:1; cursor:pointer; white-space:nowrap; }
+  .btn:hover { border-color:var(--line-strong); background:var(--hover); text-decoration:none; }
+  .btn.primary { background:var(--acc); border-color:var(--acc); color:#fff; } .btn.primary:hover { background:var(--acc-hover); border-color:var(--acc-hover); }
+  .btn.danger { color:var(--danger); } .btn.danger:hover { background:var(--danger-tint); border-color:var(--danger); }
+  .btn.ghost { background:transparent; border-color:transparent; color:var(--mute); } .btn.ghost:hover { background:var(--chip); color:var(--fg); }
+  .btn.icon { padding:0 7px; } .btn.wide { width:100%; height:34px; }
+  .btn[aria-pressed=true] { color:var(--acc); border-color:var(--acc); background:var(--acc-tint); }
+  .pill { display:inline-flex; align-items:center; gap:6px; height:22px; padding:0 9px; border-radius:999px; font-size:12px; font-weight:500; white-space:nowrap; }
+  .pill i { width:6px; height:6px; border-radius:50%; background:currentColor; }
+  .pill.ok { background:var(--ok-bg); color:var(--ok-fg); } .pill.ok i { background:var(--ok-dot); }
+  .pill.warn { background:var(--warn-bg); color:var(--warn-fg); } .pill.warn i { background:var(--warn-dot); }
+  .pill.off { background:var(--off-bg); color:var(--off-fg); } .pill.off i { background:var(--off-dot); }
+  .pill.ext { background:var(--ext-bg); color:var(--ext-fg); } .pill.ext i { background:var(--ext-dot); }
+  .pill.danger { background:var(--danger-tint); color:var(--danger); }
+  .pill.accent { background:var(--acc); color:#fff; }
+  .list { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .row { position:relative; display:flex; align-items:center; gap:8px; padding:10px 12px 10px 14px; border-top:1px solid var(--line); }
+  .row:first-child { border-top:0; } .row:not(.active):hover { background:var(--hover); }
+  .row.active { background:var(--acc-tint); box-shadow:inset 3px 0 0 var(--acc); }
+  .row .main { flex:1; min-width:0; display:flex; flex-direction:column; color:inherit; }
+  .row .main::after { content:""; position:absolute; inset:0; } /* the whole row switches */
+  .row .main:hover { text-decoration:none; } .row:hover .name { color:var(--acc); }
+  .name { font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .port { font-size:12px; color:var(--mute); }
+  .actions { position:relative; z-index:1; display:flex; flex-wrap:wrap; justify-content:flex-end; align-items:center; gap:6px; pointer-events:none; }
+  .actions a, .actions form { pointer-events:auto; } /* pills and gaps click through to the row */
+  form { margin:0; }
+  input { font:inherit; height:30px; padding:0 10px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); min-width:0; }
+  input:focus { outline:none; border-color:var(--acc); box-shadow:var(--ring); }
+  .other { display:flex; align-items:center; gap:8px; margin-top:14px; } .other label { color:var(--mute); font-size:13px; } .other input { flex:1; }
+  .msg { background:var(--danger-tint); color:var(--danger); border-radius:8px; padding:10px 12px; margin:0 0 14px; font-size:13px; white-space:pre-wrap; }
+  .card { max-width:380px; margin:72px auto 0; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:24px; }
+  .card h1 { font-size:17px; margin:12px 0 4px; }
+  .badge { width:34px; height:34px; border-radius:8px; display:inline-flex; align-items:center; justify-content:center; background:var(--danger-tint); color:var(--danger); }
+  .chip { background:var(--chip); border-radius:4px; padding:1px 6px; font-size:12px; }
+  .label { display:block; font-size:12px; color:var(--mute); margin:0 0 6px; }
+  .buttons { display:flex; flex-wrap:wrap; gap:8px; }
+  @media (max-width:520px) { .row { flex-wrap:wrap; } .actions { width:100%; } }`;
 
-const page = (title: string, body: string, head = '') => `<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">${head}
-<title>${esc(title)}</title><style>${STYLE}</style></head><body><main>${body}</main></body></html>`;
+// Icons: inline SVG (no icon font or CDN), stroke paths on a 24x24 grid.
+const ICONS = {
+  mark: '<path d="M7 10h14l-4-4"/><path d="M17 14H3l4 4"/>',
+  logs: '<path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z"/><path d="M9 13h6M9 17h6"/>',
+  server: '<rect x="3" y="4" width="18" height="8" rx="3"/><rect x="3" y="12" width="18" height="8" rx="3"/><path d="M7 8v.01M7 16v.01"/>',
+  logout: '<path d="M14 8V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h7a2 2 0 0 0 2-2v-2"/><path d="M9 12h12l-3-3m0 6 3-3"/>',
+  start: '<path d="M7 4v16l13-8z"/>',
+  restart: '<path d="M20 11A8.1 8.1 0 0 0 4.5 9M4 5v4h4"/><path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4"/>',
+  stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
+  back: '<path d="M5 12h14M5 12l6 6M5 12l6-6"/>',
+  unplug: '<path d="M7 12l5 5-1.5 1.5a3.5 3.5 0 1 1-5-5L7 12zM17 12l-5-5 1.5-1.5a3.5 3.5 0 1 1 5 5L17 12zM3 21l2.5-2.5M18.5 5.5 21 3M10 11l-2 2M13 14l-2 2"/>',
+};
+type IconName = keyof typeof ICONS;
+const icon = (name: IconName, size = 16) =>
+  `<svg class="ic" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
+const FAVICON = 'data:image/svg+xml,' + encodeURIComponent(
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="24" height="24" rx="6" fill="#4f6ef7"/>` +
+  `<g transform="translate(4 4) scale(.667)" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">${ICONS.mark}</g></svg>`);
+const brand = (href?: string) => {
+  const inner = `<span class="mark">${icon('mark', 15)}</span>port-switch`;
+  return href ? `<a class="brand" href="${href}">${inner}</a>` : `<span class="brand">${inner}</span>`;
+};
+
+const htmlHead = (title: string, extra = '') => `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">${extra}
+<link rel="icon" href="${FAVICON}"><title>${esc(title)} · port-switch</title><style>${STYLE}</style>`;
+
+/** A page with the top bar (brand + nav) for signed-in pages, or bare for login and error pages. */
+function page(title: string, body: string, { head = '', nav = false }: { head?: string; nav?: boolean } = {}): string {
+  const topbar = nav ? `<header class="topbar">${brand(SWITCH_PATH)}<nav>
+  <a class="btn ghost" href="${SWITCH_PATH}/logs">${icon('logs')}All logs</a>
+  <a class="btn ghost" href="${SWITCH_PATH}/log/${launcher.PROXY}">${icon('server')}Proxy log</a>
+  <a class="btn ghost" href="${SWITCH_PATH}/logout">${icon('logout')}Log out</a></nav></header>` : '';
+  return `${htmlHead(title, head)}</head><body>${topbar}<main>${body}</main></body></html>`;
+}
 
 type Action = 'start' | 'stop' | 'restart';
 const ACTIONS: readonly Action[] = ['start', 'stop', 'restart'];
+const ACTION_STYLE: Record<Action, string> = { start: 'primary', restart: '', stop: 'danger' };
 
-const actionButton = (action: Action, name: string) =>
-  `<form method="post" action="${SWITCH_PATH}/${action}/${encodeURIComponent(name)}"><button>${action[0].toUpperCase() + action.slice(1)}</button></form>`;
+const actionButton = (action: Action, name: string, label = action[0].toUpperCase() + action.slice(1)) =>
+  `<form method="post" action="${SWITCH_PATH}/${action}/${encodeURIComponent(name)}"><button class="btn ${ACTION_STYLE[action]}">${icon(action, 14)}${esc(label)}</button></form>`;
+
+const STATE_PILL: Record<State, [string, string]> = {
+  running: ['ok', 'Running'], starting: ['warn', 'Starting'], stopped: ['off', 'Stopped'], external: ['ext', 'External'],
+};
+const statePill = (state: State) => `<span class="pill ${STATE_PILL[state][0]}" title="${STATE_PILL[state][1].toLowerCase()}"><i></i>${STATE_PILL[state][1]}</span>`;
 
 async function renderSwitchPage(res: Res, msg: string | null): Promise<void> {
   reloadConfig();
@@ -239,38 +324,32 @@ async function renderSwitchPage(res: Res, msg: string | null): Promise<void> {
     const buttons = e.unregistered || !e.cmd ? '' : state === 'running' || state === 'starting'
       ? actionButton('restart', e.name) + actionButton('stop', e.name)
       : state === 'stopped' ? actionButton('start', e.name) : '';
-    const log = e.unregistered || !e.cmd ? '' : `<a class="log" href="${SWITCH_PATH}/log/${encodeURIComponent(e.name)}">log</a>`;
+    const log = e.unregistered || !e.cmd ? ''
+      : `<a class="btn ghost icon" href="${SWITCH_PATH}/log/${encodeURIComponent(e.name)}" title="Logs" aria-label="${esc(e.name)} logs">${icon('logs')}</a>`;
     return `<div class="row${active ? ' active' : ''}">
-      <a class="main" href="${SWITCH_PATH}/${e.port}">
-        <span class="dot ${state}" title="${state}"></span>
-        <span class="name">${esc(e.name)}</span>
-        <span class="port">:${e.port}</span>
-        ${active ? '<span class="tag">active</span>' : ''}
+      <a class="main" href="${SWITCH_PATH}/${e.port}" title="Switch to ${esc(e.name)}">
+        <span class="name">${esc(e.name)}</span><span class="port mono">:${e.port}</span>
       </a>
-      <span class="state">${state}</span>${log}${buttons}
+      <div class="actions">${active ? '<span class="pill accent">Active</span>' : ''}${statePill(state)}${log}${buttons}</div>
     </div>`;
   }).join('');
 
   const custom = ALLOW_UNREGISTERED ? `
-    <form class="custom" onsubmit="location.href='${SWITCH_PATH}/'+this.p.value;return false">
-      <input name="p" type="number" min="1" max="65535" placeholder="other port" required>
-      <button>Go</button>
+    <form class="other" onsubmit="location.href='${SWITCH_PATH}/'+this.p.value;return false">
+      <label for="p">Other port</label>
+      <input id="p" name="p" class="mono" type="number" min="1" max="65535" placeholder="4000" required>
+      <button class="btn">Switch</button>
     </form>` : '';
 
   const errors = [configError && `servers.json: ${configError}`, msg].filter(Boolean);
-  // Keep refreshing while something is booting so the dot turns green on its own.
+  // Keep refreshing while something is booting so its status turns green on its own.
   const head = states.some((s) => s.state === 'starting') ? `<meta http-equiv="refresh" content="2;url=${SWITCH_PATH}">` : '';
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-  res.end(page('Switch server', `
-<h1>Switch server</h1>
-<p>Currently proxying to <b>${esc(nameOf(target))}</b> (:${target})</p>
+  res.end(page('Servers', `
+<h1>Servers</h1>
+<p class="sub">Proxying to <b>${esc(nameOf(target))}</b> <span class="mono">:${target}</span></p>
 ${errors.map((m) => `<p class="msg">${esc(m)}</p>`).join('')}
-${rows}${custom}
-<p style="margin-top:24px;font-size:13px">
-  <a href="${SWITCH_PATH}/logs" style="color:inherit">All logs</a> &middot;
-  <a href="${SWITCH_PATH}/log/${launcher.PROXY}" style="color:inherit">Proxy log</a> &middot;
-  <a href="${SWITCH_PATH}/logout" style="color:inherit">Log out</a>
-</p>`, head));
+<div class="list">${rows}</div>${custom}`, { head, nav: true }));
 }
 
 function doSwitch(port: number, res: Res): void {
@@ -554,37 +633,33 @@ function showLogText(res: Res, name: string, query: string): void {
 const LOG_STYLE = `
   html, body { height:100%; }
   body { display:flex; flex-direction:column; }
-  header { display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--card); }
-  header h1 { margin:0; font-size:16px; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  header a { color:var(--mute); font-size:13px; }
-  .conn { font-size:12px; color:var(--mute); display:flex; align-items:center; gap:6px; }
-  .conn .dot { background:#888; } .conn.live .dot { background:#2bb24c; } .conn.wait .dot { background:#e0a020; } .conn.dead .dot { background:#d0473b; }
-  header button { font-size:13px; padding:4px 10px; } header button[aria-pressed=true] { border-color:var(--acc); color:var(--acc); }
-  #out { flex:1; overflow:auto; margin:0; padding:8px 12px 24px; background:#111214; color:#d6d6d6;
-         font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; white-space:pre; }
+  .topbar h1 { font-size:15px; margin:0 4px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .topbar .tools { margin-left:auto; display:flex; gap:6px; }
+  #out { flex:1; overflow:auto; margin:0; padding:10px 16px 28px; background:#0b0c0f; color:#d6d6d6;
+         font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; white-space:pre; }
   #out.wrap { white-space:pre-wrap; overflow-wrap:anywhere; }
-  .ln { min-height:1.45em; }
-  .sys { color:#8a8f98; font-style:italic; }
+  .ln { min-height:1.5em; }
+  .sys { color:#7d838d; font-style:italic; }
   .tag { display:inline-block; margin-right:1ch; font-weight:600; }
-  #bottom { position:fixed; right:20px; bottom:20px; display:none; box-shadow:0 2px 8px rgba(0,0,0,.4); }`;
+  #bottom { position:fixed; right:20px; bottom:20px; display:none; box-shadow:0 4px 14px rgba(0,0,0,.35); }`;
 
 function renderLogViewer(res: Res, { title, streamUrl, combined, names }: { title: string; streamUrl: string; combined: boolean; names: string[] }): void {
   const opts: LogClientOptions = { streamUrl, combined, tagWidth: Math.max(...names.map((n) => n.length)) };
   const json = JSON.stringify(opts).replace(/</g, '\\u003c');
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-  res.end(`<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${esc(title)}</title><style>${STYLE}${LOG_STYLE}</style></head><body>
-<header>
-  <a href="${SWITCH_PATH}">&larr; servers</a>
+  res.end(`${htmlHead(title, `<style>${LOG_STYLE}</style>`)}</head><body>
+<header class="topbar">
+  <a class="btn ghost icon" href="${SWITCH_PATH}" title="All servers" aria-label="Back to servers">${icon('back')}</a>
   <h1>${esc(title)}</h1>
-  <span class="conn wait" id="conn"><span class="dot"></span><span id="conn-text">connecting</span></span>
-  <button id="pause" aria-pressed="false">Pause</button>
-  <button id="wrap" aria-pressed="false">Wrap</button>
-  <button id="clear">Clear</button>
+  <span class="pill warn" id="conn"><i></i><span id="conn-text">Connecting</span></span>
+  <div class="tools">
+    <button class="btn" id="pause" aria-pressed="false">Pause</button>
+    <button class="btn" id="wrap" aria-pressed="false">Wrap</button>
+    <button class="btn" id="clear">Clear</button>
+  </div>
 </header>
 <pre id="out"></pre>
-<button id="bottom">&darr; Latest</button>
+<button class="btn primary" id="bottom">Latest &darr;</button>
 <script>(${logClient.toString()})(${json});</script>
 </body></html>`);
 }
@@ -609,13 +684,14 @@ function badGateway(res: Res, port: number, err: unknown): void {
   const entry = entryOf(port);
   let running = true;
   try { running = !!entry && !!launcher.getPid(entry.name); } catch {}
-  const startBtn = entry?.cmd && !running
-    ? `<form method="post" action="${SWITCH_PATH}/start/${encodeURIComponent(entry.name)}"><button>Start ${esc(entry.name)}</button></form>` : '';
+  const startBtn = entry?.cmd && !running ? actionButton('start', entry.name, `Start ${entry.name}`) : '';
   res.writeHead(502, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-  res.end(page('502', `
-<h1>${esc(nameOf(port))} (:${port}) isn't responding</h1>
-<p>${esc(errText(err))}</p>${startBtn}
-<p><a href="${SWITCH_PATH}">Switch server &rarr;</a></p>`));
+  res.end(page('Not responding', `<div class="card">
+  <span class="badge">${icon('unplug', 18)}</span>
+  <h1>${esc(nameOf(port))} isn't responding</h1>
+  <p class="sub"><span class="mono">:${port}</span> &middot; <span class="chip mono">${esc(errText(err))}</span></p>
+  <div class="buttons">${startBtn}<a class="btn" href="${SWITCH_PATH}">All servers</a></div>
+</div>`));
 }
 
 const hasBody = (req: Req) => !!req.headers['transfer-encoding'] || Number(req.headers['content-length']) > 0;
