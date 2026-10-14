@@ -145,3 +145,7 @@ yarn archive:win    # same, from cmd with Windows' tar
 ```
 
 `src/logClient.ts` runs in the browser: `switch.ts` inlines it into the viewer page with `toString()`, so it must stay self-contained (no imports, nothing from outside the function).
+
+## License
+
+MIT, see [LICENSE](LICENSE).

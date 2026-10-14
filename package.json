@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Zero-dependency reverse proxy that switches one port between local dev servers, plus portctl to run them in the background",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "MIT",
   "engines": {
     "node": ">=16"
   },
