@@ -747,10 +747,12 @@ const hasBody = (req: Req) => !!req.headers['transfer-encoding'] || Number(req.h
 function proxy(req: Req, res: Res, retry = true): void {
   const port = target;
   if (port === null) { req.resume(); renderIdle(res); return; }
-  const up = http.request({
-    host: UPSTREAM_HOST, port, method: req.method, path: req.url,
-    headers: upstreamHeaders(req, port),
-  }, (pres) => {
+  const headers = upstreamHeaders(req, port);
+  // A plain request never asks the server to switch protocols (see the 'upgrade' handler).
+  delete headers.upgrade;
+  delete headers['http2-settings'];
+  if (/upgrade/i.test(String(headers.connection ?? ''))) delete headers.connection;
+  const up = http.request({ host: UPSTREAM_HOST, port, method: req.method, path: req.url, headers }, (pres) => {
     const headers = { ...pres.headers };
     if (headers.location) headers.location = fixLocation(headers.location);
     res.writeHead(pres.statusCode ?? 502, pres.statusMessage, headers);
@@ -813,7 +815,7 @@ async function handleSwitch(req: Req, res: Res, urlPath: string, query: string):
   res.end('not found\n');
 }
 
-const server = http.createServer((req, res) => {
+function route(req: Req, res: Res): void {
   const [urlPath, query = ''] = (req.url ?? '/').split('?');
   if (urlPath === SWITCH_PATH || urlPath.startsWith(SWITCH_PATH + '/')) {
     handleSwitch(req, res, urlPath, query).catch((err) => {
@@ -824,46 +826,79 @@ const server = http.createServer((req, res) => {
     return;
   }
   proxy(req, res);
+}
+
+const server = http.createServer(route);
+
+const closeWith = (socket: Duplex, status: number) => {
+  if (!socket.writable) { socket.destroy(); return; }
+  socket.end(`HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+};
+
+// Requests with an Upgrade header. Node hands these over as a bare socket, and whatever we
+// do with it decides what *later* requests on the same connection reach. The rule: a
+// connection becomes a tunnel to the server only once the server has answered 101. Before
+// that it's still ordinary HTTP to the client (and to an outer proxy pooling connections),
+// so if it were piped to the server early, the next requests on it -- /switch pages
+// included -- would skip this proxy and land on the server ("Cannot GET /switch/...").
+server.on('upgrade', (req: Req, socket: Duplex, head: Buffer) => {
+  socket.on('error', () => {});
+  const urlPath = (req.url ?? '/').split('?')[0];
+  const ours = urlPath === SWITCH_PATH || urlPath.startsWith(SWITCH_PATH + '/');
+  if (ours || !/^websocket$/i.test(String(req.headers.upgrade ?? ''))) answerPlainly(req, socket);
+  else tunnelWebSocket(req, socket, head);
 });
 
-// WebSocket / any Upgrade: raw TCP tunnel to the active target.
-server.on('upgrade', (req: Req, socket: Duplex, head: Buffer) => {
+/** Serve an upgrade request that isn't an app WebSocket (anything under /switch, h2c, ...)
+ *  as a normal request, then close the connection. */
+function answerPlainly(req: Req, socket: Duplex): void {
+  if (hasBody(req)) { closeWith(socket, 400); return; } // its body is no longer parsed for us
+  const res = new http.ServerResponse(req);
+  res.shouldKeepAlive = false;
+  res.assignSocket(socket as net.Socket);
+  res.on('finish', () => socket.end());
+  route(req, res);
+}
+
+function tunnelWebSocket(req: Req, socket: Duplex, head: Buffer): void {
   const port = target;
-  if (port === null) { // "None": nothing to connect to
-    socket.on('error', () => {});
-    socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
-    return;
-  }
-  let connected = false;
-  const up = net.connect(port, UPSTREAM_HOST, () => {
-    connected = true;
-    up.setTimeout(0);
-    const headers = upstreamHeaders(req, port);
-    let raw = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`;
-    for (const [k, v] of Object.entries(headers)) {
-      if (v === undefined) continue;
-      for (const val of Array.isArray(v) ? v : [v]) raw += `${k}: ${val}\r\n`;
-    }
-    up.write(raw + '\r\n');
-    if (head?.length) up.write(head);
-    socket.pipe(up).pipe(socket);
+  if (port === null) { closeWith(socket, 503); return; } // "None": nothing to connect to
+  let settled = false;
+  const up = http.request({
+    host: UPSTREAM_HOST, port, method: req.method, path: req.url,
+    headers: upstreamHeaders(req, port), agent: false, timeout: 5000,
   });
-  // Small messages (HMR updates) go out at once; dead peers on either side get noticed.
-  for (const s of [socket as net.Socket, up]) { s.setNoDelay(true); s.setKeepAlive(true, 30000); }
-  up.setTimeout(5000, () => up.destroy(new Error('connect timeout')));
-  const close = () => { up.destroy(); socket.destroy(); tunnels.delete(socket); };
-  tunnels.add(socket);
-  up.on('error', (err) => {
-    if (!connected) {
-      console.log(`[proxy] websocket ${req.url} -> :${port}: ${errText(err)}`);
-      if (socket.writable) socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
-    }
-    close();
+  const decline = (status: number, why: string) => {
+    if (settled) return;
+    settled = true;
+    console.log(`[proxy] websocket ${req.url} -> :${port}: ${why}`);
+    closeWith(socket, status);
+  };
+  up.on('timeout', () => up.destroy(new Error('no answer within 5s')));
+  up.on('error', (err) => decline(502, errText(err)));
+  // Answered without switching protocols (e.g. 404 from an app with no WebSocket there):
+  // pass the status on and close the connection; never tunnel it.
+  up.on('response', (pres) => { pres.resume(); decline(pres.statusCode ?? 502, `declined (${pres.statusCode})`); });
+  up.on('upgrade', (pres, upSocket, upHead) => {
+    settled = true;
+    upSocket.setTimeout(0);
+    let raw = `HTTP/1.1 101 ${pres.statusMessage || 'Switching Protocols'}\r\n`;
+    for (let i = 0; i < pres.rawHeaders.length; i += 2) raw += `${pres.rawHeaders[i]}: ${pres.rawHeaders[i + 1]}\r\n`;
+    socket.write(raw + '\r\n');
+    if (upHead.length) socket.write(upHead);
+    if (head.length) upSocket.write(head);
+    // Small messages (HMR updates) go out at once; dead peers on either side get noticed.
+    for (const s of [socket as net.Socket, upSocket]) { s.setNoDelay(true); s.setKeepAlive(true, 30000); }
+    const close = () => { upSocket.destroy(); socket.destroy(); tunnels.delete(socket); };
+    tunnels.add(socket);
+    upSocket.on('error', close);
+    upSocket.on('close', close);
+    socket.on('close', close);
+    socket.pipe(upSocket).pipe(socket);
   });
-  up.on('close', close);
-  socket.on('error', close);
-  socket.on('close', close);
-});
+  socket.on('close', () => { if (!settled) up.destroy(); });
+  up.end();
+}
 
 // Keep idle client connections open longer than the outer proxy does (nginx 60s, Traefik
 // 90s, Cloudflare 90s, ...). If we closed first, it could send a request on a connection
