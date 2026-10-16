@@ -122,7 +122,8 @@ If one exits right away, the end of its log is printed.
   --all     every server that is stopped (not the proxy)
 
 Output goes to run/<name>.log. The previous run's log is kept as run/<name>.log.1,
-the one before as .2, and so on, up to "logs": { "keep": N } in servers.json (default 5).
+the one before as .2, and so on, up to "logs": { "keep": N } in servers.json (default 5),
+or PORT_SWITCH_LOG_KEEP=N in the environment or .env, which wins.
 Starting a server that's already running is not an error.`,
 
   stop: `usage: portctl stop [name...|--all]
@@ -186,6 +187,12 @@ export function loadConfig(): Config {
     throw new Error('servers.json: proxy.path must look like "/switch"');
   }
   const logs = { keep: 5, ...raw.logs };
+  // PORT_SWITCH_LOG_KEEP (environment or .env) wins over servers.json.
+  const keepEnv = process.env.PORT_SWITCH_LOG_KEEP;
+  if (keepEnv !== undefined && keepEnv.trim() !== '') {
+    logs.keep = /^\d+$/.test(keepEnv.trim()) ? Number(keepEnv) : NaN;
+    if (!(logs.keep <= 100)) throw new Error('PORT_SWITCH_LOG_KEEP must be a whole number from 0 to 100');
+  }
   if (!Number.isInteger(logs.keep) || logs.keep < 0 || logs.keep > 100) {
     throw new Error('servers.json: logs.keep must be a whole number from 0 to 100');
   }
@@ -350,6 +357,10 @@ export async function start(entry: ServerEntry): Promise<number> {
 /** Keep previous runs' logs: <name>.log -> .log.1 -> .log.2 ... up to `keep` (0 = just overwrite). */
 function rotateLog(name: string, keep: number): void {
   const file = logFile(name);
+  // Runs past the limit (left from a higher setting) go, so lowering it takes effect.
+  for (let i = keep + 1; i <= 100; i++) {
+    try { fs.rmSync(`${file}.${i}`, { force: true }); } catch {}
+  }
   if (!keep || !fs.existsSync(file)) return;
   try {
     fs.rmSync(`${file}.${keep}`, { force: true });
