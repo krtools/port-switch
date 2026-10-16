@@ -213,6 +213,7 @@ const STYLE = `
     --ok-bg:#14301f; --ok-fg:#7ee2a1; --ok-dot:#3ccf74; --warn-bg:#33270c; --warn-fg:#f2c45a; --warn-dot:#e0a52a;
     --off-bg:#23272f; --off-fg:#a3a9b3; --off-dot:#6b7280; --ext-bg:#162845; --ext-fg:#8db4ff; --ext-dot:#5b93f5; } }
   * { box-sizing:border-box; }
+  [hidden] { display:none !important; } /* .btn's display would otherwise win */
   body { margin:0; background:var(--bg); color:var(--fg); -webkit-font-smoothing:antialiased;
          font:14px/1.45 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; font-variant-numeric:tabular-nums; }
   a { color:var(--acc); text-decoration:none; } a:hover { text-decoration:underline; }
@@ -284,6 +285,11 @@ const ICONS = {
   restart: '<path d="M20 11A8.1 8.1 0 0 0 4.5 9M4 5v4h4"/><path d="M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
   back: '<path d="M5 12h14M5 12l6 6M5 12l6-6"/>',
+  search: '<circle cx="10" cy="10" r="7"/><path d="M21 21l-6-6"/>',
+  x: '<path d="M18 6 6 18M6 6l12 12"/>',
+  up: '<path d="M6 15l6-6 6 6"/>',
+  down: '<path d="M6 9l6 6 6-6"/>',
+  jump: '<path d="M9 6l6 6-6 6"/>',
   power: '<path d="M7 6a7.75 7.75 0 1 0 10 0"/><path d="M12 4v8"/>',
   unplug: '<path d="M7 12l5 5-1.5 1.5a3.5 3.5 0 1 1-5-5L7 12zM17 12l-5-5 1.5-1.5a3.5 3.5 0 1 1 5 5L17 12zM3 21l2.5-2.5M18.5 5.5 21 3M10 11l-2 2M13 14l-2 2"/>',
 };
@@ -492,7 +498,26 @@ function tailOffset(file: string, lines: number): { offset: number; count: numbe
   return { offset: from + i, count };
 }
 
-interface HistoryPart { file: string; label: string; start: number; end: number }
+interface HistoryPart {
+  file: string;
+  label: string;
+  start: number; // byte range to send
+  end: number;
+  startedAt: string | null; // when that run started / ended (ISO); endedAt is null for the current run
+  endedAt: string | null;
+}
+
+/** When a log's run started: portctl writes "# <ISO time>  (cwd ...)" as its first line. */
+function runStartedAt(file: string): string | null {
+  let head = '';
+  try { head = readRange(file, 0, 64).toString('latin1'); } catch { return null; }
+  return /^# (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z)/.exec(head)?.[1] ?? null;
+}
+
+/** When a previous run ended: the last write to its log. */
+function runEndedAt(file: string): string | null {
+  try { return fs.statSync(file).mtime.toISOString(); } catch { return null; }
+}
 
 /** The last `lines` lines of a server's log, reaching back into previous runs
  *  (<name>.log.1, .2, ... kept by portctl) when the current run is shorter.
@@ -505,7 +530,14 @@ function logHistory(name: string, lines: number): HistoryPart[] {
     const f = run ? `${file}.${run}` : file;
     if (run && !fs.existsSync(f)) break;
     const { offset, count } = tailOffset(f, need);
-    parts.unshift({ file: f, label: run ? `previous run (${path.basename(f)})` : 'current run', start: offset, end: fileSize(f) });
+    parts.unshift({
+      file: f,
+      label: run ? `previous run (${path.basename(f)})` : 'current run',
+      start: offset,
+      end: fileSize(f),
+      startedAt: runStartedAt(f),
+      endedAt: run ? runEndedAt(f) : null,
+    });
     need -= count;
   }
   return parts;
@@ -618,7 +650,7 @@ function streamLogs(req: Req, res: Res, names: string[], lines: number): void {
       const size = fileSize(s.file);
       if (sig !== s.sig || size < s.offset) {
         Object.assign(s, { sig, offset: 0, decoder: new StringDecoder('utf8') });
-        send('reset', { n: s.name });
+        send('reset', { n: s.name, startedAt: runStartedAt(s.file) });
       }
       while (s.offset < size && !closed) {
         const end = Math.min(size, s.offset + 256 * 1024);
@@ -639,7 +671,7 @@ function streamLogs(req: Req, res: Res, names: string[], lines: number): void {
   const sendOlder = (s: LogStream) => {
     if (!s.older.length) return;
     for (const part of s.older) {
-      send('run', { n: s.name, label: part.label });
+      send('run', { n: s.name, label: part.label, startedAt: part.startedAt, endedAt: part.endedAt });
       const decoder = new StringDecoder('utf8');
       for (let pos = part.start; pos < part.end;) {
         let chunk: Buffer;
@@ -653,7 +685,7 @@ function streamLogs(req: Req, res: Res, names: string[], lines: number): void {
         if (text) send('', { n: s.name, t: text });
       }
     }
-    send('run', { n: s.name, label: 'current run' });
+    send('run', { n: s.name, label: 'current run', startedAt: runStartedAt(s.file), endedAt: null });
   };
   try {
     streams.forEach((s) => { sendOlder(s); pump(s); });
@@ -666,12 +698,27 @@ function streamLogs(req: Req, res: Res, names: string[], lines: number): void {
   ping = setInterval(() => { if (!closed) res.write(': ping\n\n'); }, 20000); // keeps idle proxies from dropping it
 }
 
+const fmtDuration = (ms: number): string => {
+  const s = Math.max(0, Math.round(ms / 1000));
+  const [d, h, m] = [Math.floor(s / 86400), Math.floor((s % 86400) / 3600), Math.floor((s % 3600) / 60)];
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`;
+};
+
+/** " · 2026-10-14 17:02:11Z -> 18:40:05Z (1h 38m)" for the plain-text dividers (UTC). */
+function runSpan(startedAt: string | null, endedAt: string | null): string {
+  const t = (iso: string) => iso.replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+  if (!startedAt) return '';
+  if (!endedAt) return ` · started ${t(startedAt)}`;
+  const end = startedAt.slice(0, 10) === endedAt.slice(0, 10) ? t(endedAt).slice(11) : t(endedAt);
+  return ` · ${t(startedAt)} -> ${end} (${fmtDuration(Date.parse(endedAt) - Date.parse(startedAt))})`;
+}
+
 function showLogText(res: Res, name: string, query: string): void {
   const parts = logHistory(name, clampLines(query, LOG_LINES));
   const text = parts.map((p) => {
     let body = '';
     try { body = readRange(p.file, p.start, p.end).toString('utf8'); } catch {}
-    if (parts.length > 1) body = `----- ${name}: ${p.label} -----\n${body}${body && !body.endsWith('\n') ? '\n' : ''}`;
+    if (parts.length > 1) body = `----- ${name}: ${p.label}${runSpan(p.startedAt, p.endedAt)} -----\n${body}${body && !body.endsWith('\n') ? '\n' : ''}`;
     return body;
   }).join('');
   res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
@@ -689,10 +736,43 @@ const LOG_STYLE = `
   .ln { min-height:1.5em; }
   .sys { color:#7d838d; font-style:italic; }
   .tag { display:inline-block; margin-right:1ch; font-weight:600; }
-  #bottom { position:fixed; right:20px; bottom:20px; display:none; box-shadow:0 4px 14px rgba(0,0,0,.35); }`;
+  #bottom { position:fixed; right:20px; bottom:20px; display:none; box-shadow:0 4px 14px rgba(0,0,0,.35); }
+  .filterbar { flex:none; display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:8px 16px; background:var(--card); border-bottom:1px solid var(--line); }
+  .search { flex:1; min-width:240px; display:flex; align-items:center; gap:2px; height:32px; padding:0 4px 0 10px;
+            border:1px solid var(--line); border-radius:7px; background:var(--bg); color:var(--mute); }
+  .search:focus-within { border-color:var(--acc); box-shadow:var(--ring); }
+  .search.bad, .search.bad:focus-within { border-color:var(--danger); box-shadow:none; }
+  .search input { flex:1; height:28px; border:0; background:transparent; box-shadow:none; padding:0 6px; font-size:13px; }
+  .search input:focus { box-shadow:none; }
+  .tog { width:28px; height:24px; flex:none; display:inline-flex; align-items:center; justify-content:center; border:1px solid transparent; border-radius:5px;
+         background:transparent; color:var(--mute); cursor:pointer; font:12px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  .tog:hover { background:var(--chip); color:var(--fg); }
+  .tog[aria-pressed=true] { color:var(--acc); background:var(--acc-tint); border-color:var(--acc); }
+  .tog.word { text-decoration:underline; text-underline-offset:3px; }
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:7px; overflow:hidden; }
+  .seg button { height:30px; padding:0 12px; border:0; background:transparent; color:var(--mute); font-family:inherit; font-size:13px; font-weight:500; cursor:pointer; }
+  .seg button:hover { color:var(--fg); }
+  .seg button[aria-pressed=true] { background:var(--acc-tint); color:var(--acc); }
+  select.btn { padding:0 8px; }
+  #nav { display:inline-flex; gap:2px; }
+  .count { font-size:12px; color:var(--mute); white-space:nowrap; } .count b { color:var(--fg); font-weight:500; }
+  .qerr { font-size:12px; color:var(--danger); }
+  .servers { gap:6px; padding:7px 16px; } .servers .lbl { font-size:12px; color:var(--mute); margin-right:2px; }
+  .schip { height:24px; padding:0 10px; border-radius:999px; border:1px solid var(--line); background:var(--bg); cursor:pointer;
+           font:600 12px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  .schip[aria-pressed=false] { opacity:.45; text-decoration:line-through; }
+  #out .ln.hide, #out.filtering .ln.new { display:none; }
+  #out .ln.ctx { opacity:.5; }
+  #out .ln.gap { margin-top:5px; padding-top:5px; border-top:1px dashed #2c313b; }
+  #out .ln.flash { animation:flash 1.8s ease-out; }
+  @keyframes flash { from { background:#2b3a72; } to { background:transparent; } }
+  ::highlight(ps-match) { background-color:#5c4a12; color:#ffe08a; }
+  ::highlight(ps-current) { background-color:#d9a514; color:#111; }
+  #jump { position:fixed; z-index:5; display:none; height:22px; padding:0 8px; font-size:11px; box-shadow:0 2px 8px rgba(0,0,0,.35); }`;
 
 function renderLogViewer(res: Res, { title, streamUrl, combined, names }: { title: string; streamUrl: string; combined: boolean; names: string[] }): void {
-  const opts: LogClientOptions = { streamUrl, combined, tagWidth: Math.max(...names.map((n) => n.length)) };
+  const opts: LogClientOptions = { streamUrl, combined, names, tagWidth: Math.max(...names.map((n) => n.length)) };
+  const ctxOptions = [0, 1, 2, 3, 5, 10].map((n) => `<option value="${n}">${n ? `±${n} line${n > 1 ? 's' : ''}` : 'No context'}</option>`).join('');
   const json = JSON.stringify(opts).replace(/</g, '\\u003c');
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
   res.end(`${htmlHead(title, `<style>${LOG_STYLE}</style>`)}</head><body>
@@ -706,8 +786,32 @@ function renderLogViewer(res: Res, { title, streamUrl, combined, names }: { titl
     <button class="btn" id="clear">Clear</button>
   </div>
 </header>
+<div class="filterbar">
+  <div class="search" id="search">
+    ${icon('search', 15)}
+    <input id="q" class="mono" placeholder="Filter lines  (Ctrl+F)" spellcheck="false" autocomplete="off" aria-label="Filter lines">
+    <button class="tog" id="t-case" aria-pressed="false" title="Match case">Aa</button>
+    <button class="tog word" id="t-word" aria-pressed="false" title="Whole word">ab</button>
+    <button class="tog" id="t-re" aria-pressed="false" title="Regular expression">.*</button>
+    <button class="tog" id="t-inv" aria-pressed="false" title="Invert: show lines that don't match">!</button>
+    <button class="tog" id="q-clear" title="Clear (Esc)" aria-label="Clear filter">${icon('x', 14)}</button>
+  </div>
+  <div class="seg" role="group" aria-label="Mode">
+    <button id="m-filter" aria-pressed="true" title="Show only matching lines">Filter</button>
+    <button id="m-hl" aria-pressed="false" title="Show every line, mark the matches">Highlight</button>
+  </div>
+  <select class="btn" id="ctx" title="Lines of context around each match">${ctxOptions}</select>
+  <span id="nav" hidden>
+    <button class="btn ghost icon" id="nav-prev" title="Previous match (Shift+Enter)" aria-label="Previous match">${icon('up')}</button>
+    <button class="btn ghost icon" id="nav-next" title="Next match (Enter)" aria-label="Next match">${icon('down')}</button>
+  </span>
+  <span class="count" id="count"></span>
+  <span class="qerr" id="q-err"></span>
+</div>
+${combined ? '<div class="filterbar servers" id="servers"><span class="lbl">Servers</span></div>' : ''}
 <pre id="out"></pre>
 <button class="btn primary" id="bottom">Latest &darr;</button>
+<button class="btn" id="jump" title="Show this line in the full log">Jump to ${icon('jump', 12)}</button>
 <script>(${logClient.toString()})(${json});</script>
 </body></html>`);
 }

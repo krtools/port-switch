@@ -6,6 +6,7 @@ export interface LogClientOptions {
   streamUrl: string;
   combined: boolean; // tag each line with its server's name
   tagWidth: number;
+  names: string[]; // servers in this view (chips in the combined view)
 }
 
 interface Sgr {
@@ -28,13 +29,17 @@ interface LineState {
 
 type LogEvent =
   | { type: 'message'; data: { n: string; t: string } }
-  | { type: 'reset'; data: { n: string } }
-  | { type: 'run'; data: { n: string; label: string } }
+  | { type: 'reset'; data: { n: string; startedAt?: string | null } }
+  | { type: 'run'; data: { n: string; label: string; startedAt?: string | null; endedAt?: string | null } }
   | { type: 'notice'; data: { n: string; text: string } };
 
-/** Renders the SSE log stream, including ANSI colors. */
+type Mode = 'filter' | 'highlight';
+interface Flags { case: boolean; word: boolean; re: boolean; inv: boolean }
+
+/** Renders the SSE log stream (ANSI colors included) and the filter bar. */
 export function logClient(opts: LogClientOptions): void {
-  const out = document.getElementById('out') as HTMLElement;
+  const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+  const out = $('out');
   const MAX_LINES = 5000;
   // xterm-ish palette, readable on the dark log background
   const PALETTE = ['#3b3f45', '#e06c6c', '#7fbf6a', '#d9b25c', '#6b9fe0', '#c67dd6', '#4fbfbf', '#cfd3d8',
@@ -45,6 +50,7 @@ export function logClient(opts: LogClientOptions): void {
   let paused = false;
   let queue: LogEvent[] = [];
 
+  // ---- rendering ---------------------------------------------------------
   const color256 = (n: number): string => {
     if (n < 16) return PALETTE[n];
     if (n >= 232) { const v = 8 + (n - 232) * 10; return `rgb(${v},${v},${v})`; }
@@ -114,7 +120,8 @@ export function logClient(opts: LogClientOptions): void {
 
   function newLine(name: string, st: LineState): HTMLElement {
     const el = document.createElement('div');
-    el.className = 'ln';
+    el.className = 'ln new'; // "new" = not checked against the filter yet
+    el.dataset.n = name;
     if (opts.combined) {
       const tag = document.createElement('span');
       tag.className = 'tag';
@@ -129,10 +136,12 @@ export function logClient(opts: LogClientOptions): void {
     return el;
   }
 
-  function sysLine(text: string): void {
+  function sysLine(name: string, text: string, title = ''): void {
     const el = document.createElement('div');
     el.className = 'ln sys';
+    el.dataset.n = name;
     el.textContent = text;
+    if (title) el.title = title;
     out.append(el);
     for (const st of Object.values(streams)) st.line = null;
   }
@@ -168,25 +177,333 @@ export function logClient(opts: LogClientOptions): void {
     }
   }
 
+  // ---- run markers ---------------------------------------------------------
+  const sameDay = (a: Date, b: Date) => a.toDateString() === b.toDateString();
+  const when = (iso: string, ref?: Date): string => {
+    const d = new Date(iso);
+    const time = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+    return ref && sameDay(d, ref) ? time : `${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}, ${time}`;
+  };
+  const duration = (ms: number): string => {
+    const s = Math.max(0, Math.round(ms / 1000));
+    const [d, h, m] = [Math.floor(s / 86400), Math.floor((s % 86400) / 3600), Math.floor((s % 3600) / 60)];
+    return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`;
+  };
+  /** " · Oct 14, 5:02:11 PM → 6:40:05 PM (1h 38m)", or " · started …" for a run still going. */
+  const span = (startedAt?: string | null, endedAt?: string | null): string => {
+    if (!startedAt) return '';
+    if (!endedAt) return ` · started ${when(startedAt)}`;
+    return ` · ${when(startedAt)} → ${when(endedAt, new Date(startedAt))} (${duration(Date.parse(endedAt) - Date.parse(startedAt))})`;
+  };
+
   function handle(ev: LogEvent): void {
     if (ev.type === 'notice') {
-      sysLine(`— ${ev.data.n}: ${ev.data.text} —`);
-    } else if (ev.type === 'reset' || ev.type === 'run') {
-      const name = ev.data.n;
-      delete streams[name]; // colors don't carry over between runs
-      sysLine(ev.type === 'reset' ? `— ${name}: server restarted —` : `— ${name}: ${ev.data.label} —`);
+      sysLine(ev.data.n, `— ${ev.data.n}: ${ev.data.text} —`);
+    } else if (ev.type === 'reset') {
+      delete streams[ev.data.n]; // colors don't carry over between runs
+      const at = ev.data.startedAt;
+      sysLine(ev.data.n, `— ${ev.data.n}: server restarted${at ? ` · ${when(at)}` : ''} —`, at || '');
+    } else if (ev.type === 'run') {
+      delete streams[ev.data.n];
+      const { startedAt, endedAt } = ev.data;
+      sysLine(ev.data.n, `— ${ev.data.n}: ${ev.data.label}${span(startedAt, endedAt)} —`, [startedAt, endedAt].filter(Boolean).join(' → '));
     } else {
       write(ev.data.n, ev.data.t);
     }
   }
 
+  // ---- filter --------------------------------------------------------------
+  const q = $<HTMLInputElement>('q');
+  const searchBox = $('search');
+  const errEl = $('q-err');
+  const countEl = $('count');
+  const navEl = $('nav');
+  const ctxSel = $<HTMLSelectElement>('ctx');
+  const jumpBtn = $<HTMLButtonElement>('jump');
+  const toggles: Record<keyof Flags, HTMLButtonElement> = {
+    case: $('t-case'), word: $('t-word'), re: $('t-re'), inv: $('t-inv'),
+  };
+  const modeBtns: Record<Mode, HTMLButtonElement> = { filter: $('m-filter'), highlight: $('m-hl') };
+
+  // State: the URL wins (so a filtered view can be bookmarked), then what this browser used last.
+  const params = new URLSearchParams(location.search);
+  let saved: Partial<Flags & { mode: Mode; ctx: number }> = {};
+  try { saved = JSON.parse(localStorage.getItem('port-switch-filter') || '{}'); } catch {}
+  const flag = (k: keyof Flags) => (params.has(k) ? params.get(k) === '1' : !!saved[k]);
+  const flags: Flags = { case: flag('case'), word: flag('word'), re: flag('re'), inv: flag('inv') };
+  let mode: Mode = (params.get('mode') || saved.mode) === 'highlight' ? 'highlight' : 'filter';
+  let ctx = Math.min(10, Math.max(0, Number(params.get('ctx') ?? saved.ctx ?? 0) || 0));
+  const hidden = new Set((params.get('hide') || '').split(',').filter((n) => opts.names.includes(n)));
+  q.value = params.get('q') || '';
+
+  let matcher: RegExp | null = null; // tests a line
+  let finder: RegExp | null = null; // same, global: finds each match to highlight
+  let hits: HTMLElement[] = []; // lines that match (in invert mode: that don't)
+  let cur = -1; // the hit being looked at (Enter / arrows), -1 = none yet
+  const canHighlight = typeof CSS !== 'undefined' && 'highlights' in CSS;
+
+  function compile(): void {
+    errEl.textContent = '';
+    searchBox.classList.remove('bad');
+    if (!q.value) { matcher = finder = null; return; }
+    let src = flags.re ? q.value : q.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (flags.word) src = `\\b(?:${src})\\b`;
+    try {
+      const f = flags.case ? '' : 'i';
+      const m = new RegExp(src, f);
+      finder = new RegExp(src, `${f}g`);
+      matcher = m;
+    } catch (err) {
+      // Keep the last good filter applied while the regex is half-typed.
+      searchBox.classList.add('bad');
+      errEl.textContent = String((err as Error).message).split(': ').pop() || 'Invalid regular expression';
+    }
+  }
+
+  const filtering = () => !!matcher || hidden.size > 0;
+  const isSys = (el: Element) => el.classList.contains('sys');
+  /** A line's text without its server tag (what the filter searches). */
+  const textNodes = (el: HTMLElement): Text[] => {
+    const nodes: Text[] = [];
+    const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let n = walk.nextNode(); n; n = walk.nextNode()) if (!n.parentElement?.classList.contains('tag')) nodes.push(n as Text);
+    return nodes;
+  };
+  const lineText = (el: HTMLElement) => (opts.combined ? (el.textContent || '').slice(opts.tagWidth) : el.textContent || '');
+
+  function rangesIn(el: HTMLElement, max: number): Range[] {
+    if (!finder) return [];
+    const nodes = textNodes(el);
+    const text = nodes.map((n) => n.data).join('');
+    const at = (pos: number): [Text, number] => {
+      let acc = 0;
+      for (const n of nodes) {
+        if (pos <= acc + n.data.length) return [n, pos - acc];
+        acc += n.data.length;
+      }
+      const last = nodes[nodes.length - 1];
+      return [last, last.data.length];
+    };
+    const ranges: Range[] = [];
+    finder.lastIndex = 0;
+    for (let m = finder.exec(text); m && ranges.length < max; m = finder.exec(text)) {
+      if (!m[0]) { finder.lastIndex++; continue; } // zero-width match (e.g. ^): nothing to mark
+      const r = document.createRange();
+      r.setStart(...at(m.index));
+      r.setEnd(...at(m.index + m[0].length));
+      ranges.push(r);
+    }
+    return ranges;
+  }
+
+  function paintHighlights(): void {
+    if (!canHighlight) return;
+    const reg = (CSS as unknown as { highlights: Map<string, unknown> }).highlights;
+    reg.delete('ps-match');
+    reg.delete('ps-current');
+    if (!finder || flags.inv) return;
+    const H = (window as unknown as { Highlight: new (...r: Range[]) => unknown }).Highlight;
+    const all: Range[] = [];
+    // Visible lines only, and a cap so a match-everything regex can't stall the page.
+    for (const el of hits) {
+      if (all.length > 4000) break;
+      if (el.offsetParent !== null) all.push(...rangesIn(el, 50));
+    }
+    reg.set('ps-match', new H(...all));
+    if (hits[cur]) reg.set('ps-current', new H(...rangesIn(hits[cur], 50)));
+  }
+
+  function updateCount(total: number): void {
+    if (!matcher) { countEl.textContent = hidden.size ? `${total.toLocaleString()} lines` : ''; return; }
+    countEl.innerHTML = mode === 'highlight' && cur >= 0
+      ? `<b>${cur + 1}</b> of ${hits.length.toLocaleString()}`
+      : `<b>${hits.length.toLocaleString()}</b> of ${total.toLocaleString()} lines`;
+  }
+
+  /** Re-check every line against the filter (cheap enough for 5000 lines, throttled while streaming). */
+  function apply(): void {
+    const stick = atBottom();
+    const lines: HTMLElement[] = [];
+    for (const el of Array.from(out.children) as HTMLElement[]) {
+      el.classList.remove('new', 'ctx', 'gap');
+      const serverHidden = hidden.has(el.dataset.n || '');
+      el.classList.toggle('hide', serverHidden);
+      if (!serverHidden && !isSys(el)) lines.push(el);
+    }
+    const prevCur = hits[cur];
+    hits = [];
+    if (matcher) {
+      const m = matcher;
+      const match = lines.map((el) => m.test(lineText(el)) !== flags.inv);
+      lines.forEach((el, i) => { if (match[i]) hits.push(el); });
+      if (mode === 'filter') {
+        // Show matches plus `ctx` lines either side; mark where a gap was cut out.
+        const show = match.slice();
+        if (ctx) {
+          // Context comes from the same server's lines (in the combined view, the
+          // neighbouring line is often another server's, which says nothing about the match).
+          const byServer: Record<string, number[]> = {};
+          lines.forEach((el, i) => { (byServer[el.dataset.n || ''] ||= []).push(i); });
+          for (const idx of Object.values(byServer)) {
+            idx.forEach((i, k) => {
+              if (!match[i]) return;
+              for (let j = Math.max(0, k - ctx); j <= Math.min(idx.length - 1, k + ctx); j++) show[idx[j]] = true;
+            });
+          }
+        }
+        let shownBefore = false;
+        lines.forEach((el, i) => {
+          if (!show[i]) { el.classList.add('hide'); return; }
+          if (!match[i]) el.classList.add('ctx');
+          if (ctx && shownBefore && !show[i - 1]) el.classList.add('gap'); // like grep's "--", only with context
+          shownBefore = true;
+        });
+        // A run divider stays only if some of its run's lines are shown (so matches keep
+        // their "which run, when" context without a pile of empty dividers).
+        const pending: Record<string, HTMLElement | undefined> = {};
+        for (const el of Array.from(out.children) as HTMLElement[]) {
+          const n = el.dataset.n || '';
+          if (isSys(el)) { if (!el.classList.contains('hide')) { el.classList.add('hide'); pending[n] = el; } }
+          else if (!el.classList.contains('hide') && pending[n]) { pending[n]!.classList.remove('hide'); pending[n] = undefined; }
+        }
+      }
+    }
+    cur = prevCur ? hits.indexOf(prevCur) : -1;
+    out.classList.toggle('filtering', mode === 'filter' && !!matcher);
+    updateCount(lines.length);
+    paintHighlights();
+    if (stick) out.scrollTop = out.scrollHeight;
+  }
+
+  let applyTimer: ReturnType<typeof setTimeout> | undefined;
+  const scheduleApply = (ms = 150) => { if (applyTimer === undefined) applyTimer = setTimeout(() => { applyTimer = undefined; apply(); }, ms); };
+
+  function saveState(): void {
+    const p = new URLSearchParams(location.search);
+    const set = (k: string, v: string | false) => { if (v) p.set(k, v); else p.delete(k); };
+    set('q', q.value);
+    (Object.keys(flags) as (keyof Flags)[]).forEach((k) => set(k, flags[k] && '1'));
+    set('mode', mode === 'highlight' && 'highlight');
+    set('ctx', ctx > 0 && String(ctx));
+    set('hide', [...hidden].join(','));
+    const s = p.toString();
+    history.replaceState(null, '', s ? `?${s}` : location.pathname);
+    try { localStorage.setItem('port-switch-filter', JSON.stringify({ ...flags, mode, ctx })); } catch {}
+  }
+
+  function refresh(): void {
+    compile();
+    cur = -1;
+    apply();
+    saveState();
+  }
+
+  /** Enter / Shift+Enter / arrows: step through the hits, starting from what's on screen. */
+  function step(dir: 1 | -1): void {
+    if (!hits.length) return;
+    if (cur < 0) {
+      const top = out.scrollTop;
+      const bottom = top + out.clientHeight;
+      const idx = dir === 1 ? hits.findIndex((el) => el.offsetTop >= top) : findLastIndex(hits, (el) => el.offsetTop <= bottom);
+      cur = idx >= 0 ? idx : dir === 1 ? 0 : hits.length - 1;
+    } else {
+      cur = (cur + dir + hits.length) % hits.length;
+    }
+    hits[cur].scrollIntoView({ block: 'center' });
+    updateCount(Array.from(out.children).filter((el) => !isSys(el) && !el.classList.contains('hide')).length);
+    paintHighlights();
+  }
+  const findLastIndex = <T>(arr: T[], fn: (x: T) => boolean) => { for (let i = arr.length - 1; i >= 0; i--) if (fn(arr[i])) return i; return -1; };
+
+  function setMode(m: Mode): void {
+    mode = m;
+    for (const k of Object.keys(modeBtns) as Mode[]) modeBtns[k].setAttribute('aria-pressed', String(k === m));
+    ctxSel.hidden = m !== 'filter';
+    navEl.hidden = m !== 'highlight';
+  }
+
+  let qTimer: ReturnType<typeof setTimeout> | undefined;
+  q.addEventListener('input', () => { clearTimeout(qTimer); qTimer = setTimeout(refresh, 80); });
+  q.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); step(e.shiftKey ? -1 : 1); }
+    else if (e.key === 'Escape') { if (q.value) { q.value = ''; refresh(); } else q.blur(); }
+  });
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') { e.preventDefault(); q.focus(); q.select(); }
+  });
+  (Object.keys(toggles) as (keyof Flags)[]).forEach((k) => {
+    toggles[k].setAttribute('aria-pressed', String(flags[k]));
+    toggles[k].onclick = () => { flags[k] = !flags[k]; toggles[k].setAttribute('aria-pressed', String(flags[k])); refresh(); };
+  });
+  $<HTMLButtonElement>('q-clear').onclick = () => { q.value = ''; refresh(); q.focus(); };
+  (Object.keys(modeBtns) as Mode[]).forEach((k) => { modeBtns[k].onclick = () => { setMode(k); refresh(); }; });
+  ctxSel.value = String(ctx);
+  ctxSel.onchange = () => { ctx = Number(ctxSel.value) || 0; refresh(); };
+  $<HTMLButtonElement>('nav-prev').onclick = () => step(-1);
+  $<HTMLButtonElement>('nav-next').onclick = () => step(1);
+  setMode(mode);
+
+  // Server chips (combined view): click hides/shows a server, Alt+click shows only it.
+  const chipBox = document.getElementById('servers');
+  if (chipBox && opts.combined) {
+    for (const name of opts.names) {
+      const b = document.createElement('button');
+      b.className = 'schip';
+      b.textContent = name;
+      b.style.color = tagColor(name);
+      b.title = 'Click to hide or show · Alt+click to show only this one';
+      b.setAttribute('aria-pressed', String(!hidden.has(name)));
+      b.onclick = (e) => {
+        if (e.altKey) {
+          const solo = hidden.size === opts.names.length - 1 && !hidden.has(name);
+          hidden.clear();
+          if (!solo) for (const n of opts.names) if (n !== name) hidden.add(n);
+        } else if (hidden.has(name)) hidden.delete(name);
+        else hidden.add(name);
+        for (const c of Array.from(chipBox.querySelectorAll<HTMLButtonElement>('.schip'))) c.setAttribute('aria-pressed', String(!hidden.has(c.textContent || '')));
+        refresh();
+      };
+      chipBox.append(b);
+    }
+  }
+
+  // "Jump to": from a filtered line back to the same spot in the full log.
+  let hovered: HTMLElement | null = null;
+  const hideJump = () => { jumpBtn.style.display = 'none'; hovered = null; };
+  out.addEventListener('mouseover', (e) => {
+    const el = (e.target as Element).closest('.ln') as HTMLElement | null;
+    if (!el || isSys(el) || !(mode === 'filter' && matcher) || el === hovered) return;
+    hovered = el;
+    const r = el.getBoundingClientRect();
+    const o = out.getBoundingClientRect();
+    jumpBtn.style.display = 'inline-flex';
+    jumpBtn.style.top = `${r.top + (r.height - jumpBtn.offsetHeight) / 2}px`;
+    jumpBtn.style.left = `${o.left + out.clientWidth - jumpBtn.offsetWidth - 10}px`;
+  });
+  out.addEventListener('mouseleave', (e) => { if (e.relatedTarget !== jumpBtn) hideJump(); });
+  out.addEventListener('scroll', hideJump);
+  jumpBtn.addEventListener('mouseleave', (e) => { if (!out.contains(e.relatedTarget as Node)) hideJump(); });
+  jumpBtn.onclick = () => {
+    const el = hovered;
+    hideJump();
+    if (!el) return;
+    q.value = '';
+    refresh();
+    el.scrollIntoView({ block: 'center' });
+    el.classList.remove('flash');
+    void el.offsetWidth; // restart the animation
+    el.classList.add('flash');
+  };
+
+  // ---- stream, scrolling, toolbar ------------------------------------------------
   const atBottom = () => out.scrollHeight - out.scrollTop - out.clientHeight < 40;
-  const bottomBtn = document.getElementById('bottom') as HTMLButtonElement;
+  const bottomBtn = $<HTMLButtonElement>('bottom');
   function render(events: LogEvent[]): void {
     const stick = atBottom();
     events.forEach(handle);
     if (stick) out.scrollTop = out.scrollHeight;
     bottomBtn.style.display = atBottom() ? 'none' : 'block';
+    if (filtering()) scheduleApply();
   }
   out.addEventListener('scroll', () => { bottomBtn.style.display = atBottom() ? 'none' : 'block'; });
   bottomBtn.onclick = () => { out.scrollTop = out.scrollHeight; };
@@ -196,8 +513,8 @@ export function logClient(opts: LogClientOptions): void {
     if (paused) queue.push(ev); else render([ev]);
   }
 
-  const conn = document.getElementById('conn') as HTMLElement;
-  const connText = document.getElementById('conn-text') as HTMLElement;
+  const conn = $('conn');
+  const connText = $('conn-text');
   const setConn = (cls: string, text: string) => { conn.className = `pill ${cls}`; connText.textContent = text; };
   const source = new EventSource(opts.streamUrl);
   source.onmessage = (e) => receive('message', e);
@@ -210,14 +527,14 @@ export function logClient(opts: LogClientOptions): void {
     else setConn('warn', 'Reconnecting');
   };
 
-  const pauseBtn = document.getElementById('pause') as HTMLButtonElement;
+  const pauseBtn = $<HTMLButtonElement>('pause');
   pauseBtn.onclick = () => {
     paused = !paused;
     pauseBtn.setAttribute('aria-pressed', String(paused));
     pauseBtn.textContent = paused ? 'Resume' : 'Pause';
-    if (!paused) { const q = queue; queue = []; render(q); }
+    if (!paused) { const pending = queue; queue = []; render(pending); }
   };
-  const wrapBtn = document.getElementById('wrap') as HTMLButtonElement;
+  const wrapBtn = $<HTMLButtonElement>('wrap');
   const setWrap = (on: boolean) => {
     out.classList.toggle('wrap', on);
     wrapBtn.setAttribute('aria-pressed', String(on));
@@ -225,8 +542,12 @@ export function logClient(opts: LogClientOptions): void {
   };
   wrapBtn.onclick = () => setWrap(!out.classList.contains('wrap'));
   try { setWrap(!!localStorage.getItem('port-switch-wrap')); } catch {}
-  (document.getElementById('clear') as HTMLButtonElement).onclick = () => {
+  $<HTMLButtonElement>('clear').onclick = () => {
     out.textContent = '';
     for (const st of Object.values(streams)) st.line = null;
+    apply();
   };
+
+  compile();
+  apply();
 }

@@ -50,7 +50,7 @@ To upgrade, extract a newer archive over the same folder. Archives never contain
 |---|---|---|
 | `proxy.port` | default `3000` | port the proxy listens on |
 | `proxy.path` | default `/switch` | where the switch page and its endpoints live (change it if an app uses `/switch`) |
-| `logs.keep` | default `5` | previous runs' logs to keep per server (`0` = overwrite on each start) |
+| `logs.keep` | default `5` | previous runs' logs to keep per server (`0` = overwrite on each start); `PORT_SWITCH_LOG_KEEP` overrides it |
 | `servers[].name` | required | letters, digits, `_ . -`; `proxy`, `self`, `all` and `none` are reserved |
 | `servers[].port` | required | where the server listens |
 | `servers[].cmd` | optional | shell command that starts it; without it the server can be switched to but not started |
@@ -78,6 +78,7 @@ run/<name>.log, <name>.log.1, .2, ...   current and previous runs
 | `SWITCH_PASSWORD` | required for the switch page; without it `/switch` stays locked. Use something long and random (`openssl rand -base64 24`) |
 | `SWITCH_COOKIE_DAYS` | how long a login lasts (default 365) |
 | `SWITCH_COOKIE_DOMAIN` | unset = only the exact host you logged in on; a domain also covers its subdomains |
+| `PORT_SWITCH_LOG_KEEP` | previous runs' logs to keep per server (0 to 100); overrides `logs.keep` in servers.json |
 
 Restart the proxy after changing `.env` (`portctl restart proxy`). Changing the password logs out every browser. Values from `.env` are not passed to your servers.
 
@@ -124,7 +125,15 @@ Log in once at `/switch`; the cookie lasts a year (it's HttpOnly, scoped to `/sw
 | `GET /switch/api/state` | `{"target", "name", "logStreams", "websockets"}` |
 | `/switch/login`, `/switch/logout` | |
 
-The log viewer renders 16/256/true colors, collapses `\r` progress bars, reaches back into previous runs' logs, resumes after a dropped connection, and keeps the last 5000 lines on screen. It streams over SSE: if output arrives in bursts behind your outer proxy, turn off response buffering there (the proxy already sends `X-Accel-Buffering: no` for nginx).
+The log viewer renders 16/256/true colors, collapses `\r` progress bars, reaches back into previous runs' logs (each marked with when that run started and stopped), resumes after a dropped connection, and keeps the last 5000 lines on screen.
+
+The filter bar (`Ctrl+F`) searches the lines on screen as they stream in:
+
+- toggles for match case (`Aa`), whole word (`ab`), regular expression (`.*`) and invert (`!`, show lines that *don't* match)
+- **Filter** mode shows only matching lines, optionally with ±N lines of context from the same server; hover a line and use **Jump to** to clear the filter and land on it in the full log
+- **Highlight** mode keeps every line and marks the matches; `Enter` / `Shift+Enter` (or the arrows) step through them
+- on **All logs**, server chips hide or show a server (Alt+click shows only that one)
+- the filter lives in the URL (`?q=error&re=1&ctx=2`), so reloads keep it and filtered views can be bookmarked It streams over SSE: if output arrives in bursts behind your outer proxy, turn off response buffering there (the proxy already sends `X-Accel-Buffering: no` for nginx).
 
 ## Notes
 
