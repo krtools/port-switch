@@ -132,7 +132,7 @@ The filter bar (`Ctrl+F`) searches the lines on screen as they stream in:
 - toggles for match case (`Aa`), whole word (`ab`), regular expression (`.*`) and invert (`!`, show lines that *don't* match)
 - **Filter** mode shows only matching lines, optionally with ±N lines of context from the same server; hover a line and use **Jump to** to clear the filter and land on it in the full log
 - **Highlight** mode keeps every line and marks the matches; `Enter` / `Shift+Enter` (or the arrows) step through them
-- on **All logs**, server chips hide or show a server (Alt+click shows only that one)
+- on **All logs**, the **Servers** dropdown left of the field picks which servers' lines to show (or **Only** one)
 - the filter lives in the URL (`?q=error&re=1&ctx=2`), so reloads keep it and filtered views can be bookmarked It streams over SSE: if output arrives in bursts behind your outer proxy, turn off response buffering there (the proxy already sends `X-Accel-Buffering: no` for nginx).
 
 ## Notes

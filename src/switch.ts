@@ -757,10 +757,22 @@ const LOG_STYLE = `
   #nav { display:inline-flex; gap:2px; }
   .count { font-size:12px; color:var(--mute); white-space:nowrap; } .count b { color:var(--fg); font-weight:500; }
   .qerr { font-size:12px; color:var(--danger); }
-  .servers { gap:6px; padding:7px 16px; } .servers .lbl { font-size:12px; color:var(--mute); margin-right:2px; }
-  .schip { height:24px; padding:0 10px; border-radius:999px; border:1px solid var(--line); background:var(--bg); cursor:pointer;
-           font:600 12px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
-  .schip[aria-pressed=false] { opacity:.45; text-decoration:line-through; }
+  .sdrop { position:relative; }
+  .sdrop > .btn { height:32px; color:var(--mute); } .sdrop > .btn span { color:var(--fg); }
+  .sdrop > .btn.some { border-color:var(--acc); color:var(--acc); } .sdrop > .btn.some span { color:var(--acc); }
+  .menu { position:absolute; top:calc(100% + 4px); left:0; z-index:20; min-width:240px; padding:4px; background:var(--card);
+          border:1px solid var(--line); border-radius:8px; box-shadow:0 10px 28px rgba(0,0,0,.3); }
+  .menu label { display:flex; align-items:center; gap:9px; padding:6px 8px; border-radius:6px; cursor:pointer;
+                font:600 12px/1.2 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  .menu label:hover { background:var(--hover); }
+  .menu input[type=checkbox] { margin:0; width:14px; height:14px; accent-color:var(--acc); }
+  .menu .only { margin-left:auto; padding:2px 6px; border:0; border-radius:4px; background:transparent; color:var(--mute);
+                font:500 11px/1 -apple-system,"Segoe UI",Roboto,sans-serif; cursor:pointer; visibility:hidden; }
+  .menu label:hover .only, .menu .only:focus-visible { visibility:visible; } .menu .only:hover { background:var(--chip); color:var(--fg); }
+  .menu .foot { border-top:1px solid var(--line); margin-top:4px; padding-top:4px; }
+  .menu .foot button { width:100%; text-align:left; padding:6px 8px; border:0; border-radius:6px; background:transparent; color:var(--fg);
+                       font:500 12px/1.2 -apple-system,"Segoe UI",Roboto,sans-serif; cursor:pointer; }
+  .menu .foot button:hover { background:var(--hover); }
   #out .ln.hide, #out.filtering .ln.new { display:none; }
   #out .ln.ctx { opacity:.5; }
   #out .ln.gap { margin-top:5px; padding-top:5px; border-top:1px dashed #2c313b; }
@@ -787,6 +799,12 @@ function renderLogViewer(res: Res, { title, streamUrl, combined, names }: { titl
   </div>
 </header>
 <div class="filterbar">
+  ${combined ? `<div class="sdrop" id="servers">
+    <button class="btn" id="servers-btn" aria-haspopup="true" aria-expanded="false" title="Choose which servers' lines to show">
+      ${icon('server', 15)}<span id="servers-label">All servers</span>${icon('down', 14)}
+    </button>
+    <div class="menu" id="servers-menu" role="menu" hidden></div>
+  </div>` : ''}
   <div class="search" id="search">
     ${icon('search', 15)}
     <input id="q" class="mono" placeholder="Filter lines  (Ctrl+F)" spellcheck="false" autocomplete="off" aria-label="Filter lines">
@@ -808,7 +826,6 @@ function renderLogViewer(res: Res, { title, streamUrl, combined, names }: { titl
   <span class="count" id="count"></span>
   <span class="qerr" id="q-err"></span>
 </div>
-${combined ? '<div class="filterbar servers" id="servers"><span class="lbl">Servers</span></div>' : ''}
 <pre id="out"></pre>
 <button class="btn primary" id="bottom">Latest &darr;</button>
 <button class="btn" id="jump" title="Show this line in the full log">Jump to ${icon('jump', 12)}</button>

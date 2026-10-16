@@ -6,7 +6,7 @@ export interface LogClientOptions {
   streamUrl: string;
   combined: boolean; // tag each line with its server's name
   tagWidth: number;
-  names: string[]; // servers in this view (chips in the combined view)
+  names: string[]; // servers in this view (the Servers dropdown in the combined view)
 }
 
 interface Sgr {
@@ -121,6 +121,7 @@ export function logClient(opts: LogClientOptions): void {
   function newLine(name: string, st: LineState): HTMLElement {
     const el = document.createElement('div');
     el.className = 'ln new'; // "new" = not checked against the filter yet
+    if (hidden.has(name)) el.classList.add('hide'); // a hidden server's lines never flash up
     el.dataset.n = name;
     if (opts.combined) {
       const tag = document.createElement('span');
@@ -139,6 +140,7 @@ export function logClient(opts: LogClientOptions): void {
   function sysLine(name: string, text: string, title = ''): void {
     const el = document.createElement('div');
     el.className = 'ln sys';
+    if (hidden.has(name)) el.classList.add('hide');
     el.dataset.n = name;
     el.textContent = text;
     if (title) el.title = title;
@@ -443,28 +445,57 @@ export function logClient(opts: LogClientOptions): void {
   $<HTMLButtonElement>('nav-next').onclick = () => step(1);
   setMode(mode);
 
-  // Server chips (combined view): click hides/shows a server, Alt+click shows only it.
-  const chipBox = document.getElementById('servers');
-  if (chipBox && opts.combined) {
+  // Servers dropdown (combined view): a checkbox per server, "Only" per row, "Show all".
+  const serversBtn = document.getElementById('servers-btn') as HTMLButtonElement | null;
+  const serversMenu = document.getElementById('servers-menu');
+  if (serversBtn && serversMenu && opts.combined) {
+    const label = $('servers-label');
+    const boxes: Record<string, HTMLInputElement> = {};
+    const sync = () => {
+      const shown = opts.names.filter((n) => !hidden.has(n));
+      label.textContent = !hidden.size ? 'All servers' : shown.length === 1 ? shown[0] : `${shown.length} of ${opts.names.length} servers`;
+      serversBtn.classList.toggle('some', hidden.size > 0);
+      for (const n of opts.names) boxes[n].checked = !hidden.has(n);
+    };
+    const changed = () => { sync(); refresh(); };
     for (const name of opts.names) {
-      const b = document.createElement('button');
-      b.className = 'schip';
-      b.textContent = name;
-      b.style.color = tagColor(name);
-      b.title = 'Click to hide or show · Alt+click to show only this one';
-      b.setAttribute('aria-pressed', String(!hidden.has(name)));
-      b.onclick = (e) => {
-        if (e.altKey) {
-          const solo = hidden.size === opts.names.length - 1 && !hidden.has(name);
-          hidden.clear();
-          if (!solo) for (const n of opts.names) if (n !== name) hidden.add(n);
-        } else if (hidden.has(name)) hidden.delete(name);
-        else hidden.add(name);
-        for (const c of Array.from(chipBox.querySelectorAll<HTMLButtonElement>('.schip'))) c.setAttribute('aria-pressed', String(!hidden.has(c.textContent || '')));
-        refresh();
+      const row = document.createElement('label');
+      row.setAttribute('role', 'menuitemcheckbox');
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.onchange = () => { if (box.checked) hidden.delete(name); else hidden.add(name); changed(); };
+      const text = document.createElement('span');
+      text.textContent = name;
+      text.style.color = tagColor(name);
+      const only = document.createElement('button');
+      only.type = 'button';
+      only.className = 'only';
+      only.textContent = 'Only';
+      only.title = `Show only ${name}`;
+      only.onclick = (e) => {
+        e.preventDefault(); // not a click on the label (which would toggle the checkbox)
+        hidden.clear();
+        for (const n of opts.names) if (n !== name) hidden.add(n);
+        changed();
       };
-      chipBox.append(b);
+      boxes[name] = box;
+      row.append(box, text, only);
+      serversMenu.append(row);
     }
+    const foot = document.createElement('div');
+    foot.className = 'foot';
+    const all = document.createElement('button');
+    all.type = 'button';
+    all.textContent = 'Show all';
+    all.onclick = () => { hidden.clear(); changed(); };
+    foot.append(all);
+    serversMenu.append(foot);
+
+    const open = (on: boolean) => { serversMenu.hidden = !on; serversBtn.setAttribute('aria-expanded', String(on)); };
+    serversBtn.onclick = () => open(!!serversMenu.hidden);
+    document.addEventListener('click', (e) => { if (!$('servers').contains(e.target as Node)) open(false); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !serversMenu.hidden) { open(false); serversBtn.focus(); } });
+    sync();
   }
 
   // "Jump to": from a filtered line back to the same spot in the full log.
