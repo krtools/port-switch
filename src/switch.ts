@@ -17,7 +17,7 @@
 // for a long-lived cookie, or send "Authorization: Bearer <password>" (portctl does).
 //
 // Usage: node switch.js [--config servers.json]   or   portctl start proxy
-// env: PORT_SWITCH_CONFIG PORT HOST TARGET (a port or "none") SWITCH_PASSWORD SWITCH_COOKIE_DAYS (default 365) SWITCH_COOKIE_DOMAIN
+// env: PORT_SWITCH_CONFIG PORT HOST TARGET (a port or "none"; overrides the selection saved in run/proxy.json) SWITCH_PASSWORD SWITCH_COOKIE_DAYS (default 365) SWITCH_COOKIE_DOMAIN
 
 import * as http from 'http';
 import * as net from 'net';
@@ -72,7 +72,31 @@ const LISTEN_PORT = Number(process.env.PORT) || config.proxy.port;
 const LISTEN_HOST = process.env.HOST || '0.0.0.0';
 
 // The port being proxied to, or null for "None": every request gets the idle page.
-let target: number | null = process.env.TARGET === 'none' ? null : Number(process.env.TARGET) || config.servers[0]?.port || 3001;
+// It survives restarts: saved to run/proxy.json on every switch and read back here.
+// TARGET in the environment wins; with neither, the first server in servers.json.
+function savedTarget(): { target: number | null } | undefined {
+  try {
+    const { target: t } = JSON.parse(fs.readFileSync(launcher.PROXY_STATE_FILE, 'utf8'));
+    if (t === null || (Number.isInteger(t) && t > 0 && t < 65536)) return { target: t };
+  } catch {}
+  return undefined;
+}
+function saveTarget(): void {
+  const file = launcher.PROXY_STATE_FILE;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(`${file}.tmp`, `${JSON.stringify({ target })}\n`);
+    fs.renameSync(`${file}.tmp`, file); // a crash mid-write can't leave a half-written file
+  } catch (err) {
+    console.error(`[switch] couldn't save the selection to ${file}: ${errMsg(err)}`);
+  }
+}
+const saved = savedTarget();
+const fromEnv = process.env.TARGET;
+let target: number | null = fromEnv
+  ? (fromEnv === 'none' ? null : Number(fromEnv) || config.servers[0]?.port || 3001)
+  : saved ? saved.target : config.servers[0]?.port || 3001;
+const targetSource = fromEnv ? 'from TARGET' : saved ? 'restored from the last run' : 'first in servers.json';
 
 // Open WebSocket tunnels, killed on switch so clients (e.g. HMR) reconnect to the new target.
 const tunnels = new Set<Duplex>();
@@ -406,6 +430,7 @@ function doSwitch(port: number | null, res: Res): void {
   if (port !== target) {
     console.log(`[switch] ${describe(target)} -> ${describe(port)}`);
     target = port;
+    saveTarget();
     for (const s of tunnels) s.destroy();
     tunnels.clear();
   }
@@ -1034,6 +1059,6 @@ server.on('clientError', (err: NodeJS.ErrnoException, socket: Duplex) => {
 });
 
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
-  console.log(`[port-switch] listening on ${LISTEN_HOST}:${LISTEN_PORT} -> ${describe(target)}`);
+  console.log(`[port-switch] listening on ${LISTEN_HOST}:${LISTEN_PORT} -> ${describe(target)} (${targetSource})`);
   console.log(`[port-switch] switch page: http://localhost:${LISTEN_PORT}${SWITCH_PATH}`);
 });

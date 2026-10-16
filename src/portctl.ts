@@ -244,6 +244,8 @@ function resolveNames(config: Config, names: string[]): ServerEntry[] {
 // ---- process state ---------------------------------------------------------
 const pidFile = (name: string) => path.join(RUN_DIR, `${name}.pid`);
 export const logFile = (name: string) => path.join(RUN_DIR, `${name}.log`);
+/** Where the proxy keeps its selection between restarts. */
+export const PROXY_STATE_FILE = path.join(RUN_DIR, 'proxy.json');
 const resolveCwd = (entry: ServerEntry) => path.resolve(HOME_DIR, (entry.cwd || '.').replace(/^~(?=$|[\\/])/, os.homedir()));
 
 function isAlive(pid: number): boolean {

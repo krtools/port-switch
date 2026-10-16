@@ -3,7 +3,7 @@
 // .env and run/) with the demo servers in scripts/dev-apps/. Nothing outside .dev/ is used.
 //
 //   yarn dev             build, start, then rebuild + restart the proxy on every change in
-//                        src/ (keeping the selected server); Ctrl+C stops everything
+//                        src/ (it keeps its selected server); Ctrl+C stops everything
 //   yarn dev --detach    build and start, then exit and leave it running
 //   yarn dev:stop        stop everything the dev setup started
 //   yarn dev:ctl ...     portctl against the dev setup, e.g. yarn dev:ctl status
@@ -12,7 +12,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const http = require('http');
 const { spawnSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -48,19 +47,6 @@ function build() {
   return r.status === 0;
 }
 
-/** The proxy's current target (port, or null for None), so a restart can keep it. */
-function currentTarget() {
-  return new Promise((resolve) => {
-    const req = http.get({ host: '127.0.0.1', port: BASE, path: '/switch/api/state', headers: { authorization: `Bearer ${PASSWORD}` }, timeout: 1500 }, (res) => {
-      let body = '';
-      res.on('data', (d) => { body += d; });
-      res.on('end', () => { try { resolve(JSON.parse(body).target); } catch { resolve(undefined); } });
-    });
-    req.on('timeout', () => req.destroy());
-    req.on('error', () => resolve(undefined));
-  });
-}
-
 function stopAll() {
   portctl(['stop', '--all']);
   portctl(['stop', 'proxy']);
@@ -90,8 +76,7 @@ async function watch() {
     busy = true;
     console.log(`\n[dev] ${new Date().toLocaleTimeString()} change in src/, rebuilding...`);
     if (build()) {
-      const target = await currentTarget();
-      portctl(['restart', 'proxy'], target === undefined ? {} : { TARGET: target === null ? 'none' : String(target) });
+      portctl(['restart', 'proxy']); // the proxy restores its own selection (run/proxy.json)
       console.log('[dev] proxy restarted with the new build (reload the page)');
     } else {
       console.log('[dev] build failed; the proxy keeps running the previous build');

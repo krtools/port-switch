@@ -69,6 +69,7 @@ servers.json
 .env           SWITCH_PASSWORD and other settings
 run/<name>.pid
 run/<name>.log, <name>.log.1, .2, ...   current and previous runs
+run/proxy.json  the selected server, restored when the proxy restarts
 ```
 
 ### .env
@@ -82,7 +83,7 @@ run/<name>.log, <name>.log.1, .2, ...   current and previous runs
 
 Restart the proxy after changing `.env` (`portctl restart proxy`). Changing the password logs out every browser. Values from `.env` are not passed to your servers.
 
-The proxy also reads `PORT`, `HOST` (default `0.0.0.0`) and `TARGET` (initially active port, or `none`) from the environment.
+The proxy also reads `PORT`, `HOST` (default `0.0.0.0`) and `TARGET` (a port, or `none`, to start on instead of the saved selection) from the environment.
 
 ## portctl
 
