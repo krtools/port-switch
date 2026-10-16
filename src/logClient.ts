@@ -217,7 +217,6 @@ export function logClient(opts: LogClientOptions): void {
   const searchBox = $('search');
   const errEl = $('q-err');
   const countEl = $('count');
-  const navEl = $('nav');
   const ctxSel = $<HTMLSelectElement>('ctx');
   const jumpBtn = $<HTMLButtonElement>('jump');
   const toggles: Record<keyof Flags, HTMLButtonElement> = {
@@ -315,7 +314,7 @@ export function logClient(opts: LogClientOptions): void {
 
   function updateCount(total: number): void {
     if (!matcher) { countEl.textContent = hidden.size ? `${total.toLocaleString()} lines` : ''; return; }
-    countEl.innerHTML = mode === 'highlight' && cur >= 0
+    countEl.innerHTML = cur >= 0
       ? `<b>${cur + 1}</b> of ${hits.length.toLocaleString()}`
       : `<b>${hits.length.toLocaleString()}</b> of ${total.toLocaleString()} lines`;
   }
@@ -418,8 +417,9 @@ export function logClient(opts: LogClientOptions): void {
   function setMode(m: Mode): void {
     mode = m;
     for (const k of Object.keys(modeBtns) as Mode[]) modeBtns[k].setAttribute('aria-pressed', String(k === m));
-    ctxSel.hidden = m !== 'filter';
-    navEl.hidden = m !== 'highlight';
+    // Disabled rather than hidden, so the controls next to it don't shift when switching modes.
+    ctxSel.disabled = m !== 'filter';
+    ctxSel.title = m === 'filter' ? 'Lines of context around each match' : 'Context lines apply in Filter mode';
   }
 
   let qTimer: ReturnType<typeof setTimeout> | undefined;

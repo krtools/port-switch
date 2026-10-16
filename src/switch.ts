@@ -801,7 +801,7 @@ function renderLogViewer(res: Res, { title, streamUrl, combined, names }: { titl
     <button id="m-hl" aria-pressed="false" title="Show every line, mark the matches">Highlight</button>
   </div>
   <select class="btn" id="ctx" title="Lines of context around each match">${ctxOptions}</select>
-  <span id="nav" hidden>
+  <span id="nav">
     <button class="btn ghost icon" id="nav-prev" title="Previous match (Shift+Enter)" aria-label="Previous match">${icon('up')}</button>
     <button class="btn ghost icon" id="nav-next" title="Next match (Enter)" aria-label="Next match">${icon('down')}</button>
   </span>
