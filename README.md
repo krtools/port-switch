@@ -11,7 +11,7 @@ browser ──https──> outer proxy ──> :3000 port-switch ──> :3001 a
 ```
 
 - **Switch page** at `/switch`: pick the active server, start/stop/restart servers, open their logs. Password-protected.
-- **None**: switch to nothing without stopping the proxy; visitors get a "nothing is being served" page.
+- **None**: switch to nothing without stopping the proxy; visitors get a "nothing is being served" page. It's also where a fresh install starts, so nothing is exposed until you pick a server.
 - **Everything else** on the port goes to the active server, WebSockets included (HMR works).
 - **Live log viewer** in the browser, with terminal colors, per server or all combined.
 - **`portctl`**: start/stop/restart/status/logs from the command line, servers run detached and survive logout.
@@ -69,7 +69,7 @@ servers.json
 .env           SWITCH_PASSWORD and other settings
 run/<name>.pid
 run/<name>.log, <name>.log.1, .2, ...   current and previous runs
-run/proxy.json  the selected server, restored when the proxy restarts
+run/proxy.json  the selected server, restored when the proxy restarts (until there is one: None)
 ```
 
 ### .env

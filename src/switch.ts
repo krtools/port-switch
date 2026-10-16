@@ -93,10 +93,12 @@ function saveTarget(): void {
 }
 const saved = savedTarget();
 const fromEnv = process.env.TARGET;
+// With nothing saved (first start, or the file is unreadable) it's None: nothing gets
+// exposed until a server is picked on purpose.
 let target: number | null = fromEnv
-  ? (fromEnv === 'none' ? null : Number(fromEnv) || config.servers[0]?.port || 3001)
-  : saved ? saved.target : config.servers[0]?.port || 3001;
-const targetSource = fromEnv ? 'from TARGET' : saved ? 'restored from the last run' : 'first in servers.json';
+  ? (fromEnv === 'none' ? null : Number(fromEnv) || null)
+  : saved ? saved.target : null;
+const targetSource = fromEnv ? 'from TARGET' : saved ? 'restored from the last run' : 'nothing saved yet';
 
 // Open WebSocket tunnels, killed on switch so clients (e.g. HMR) reconnect to the new target.
 const tunnels = new Set<Duplex>();
@@ -295,6 +297,15 @@ const STYLE = `
   .card h1 { font-size:17px; margin:12px 0 4px; }
   .badge { width:34px; height:34px; border-radius:8px; display:inline-flex; align-items:center; justify-content:center; background:var(--danger-tint); color:var(--danger); }
   .chip { background:var(--chip); border-radius:4px; padding:1px 6px; font-size:12px; }
+  main.empty { max-width:none; min-height:100vh; margin:0; padding:24px 16px 72px; display:flex; flex-direction:column;
+               align-items:center; justify-content:center; text-align:center; }
+  .empty .halo { width:68px; height:68px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; margin-bottom:24px;
+                 background:var(--card); border:1px solid var(--line); color:var(--mute); box-shadow:0 0 0 10px var(--chip); }
+  .empty h1 { font-size:20px; margin:0 0 8px; }
+  .empty p { color:var(--mute); margin:0; max-width:360px; line-height:1.55; }
+  .empty-foot { position:fixed; left:0; right:0; bottom:22px; display:flex; align-items:center; justify-content:center; gap:8px;
+                font-size:12px; font-weight:600; color:var(--mute); }
+  .empty-foot .mark { width:18px; height:18px; border-radius:5px; background:var(--mute); opacity:.85; }
   .label { display:block; font-size:12px; color:var(--mute); margin:0 0 6px; }
   .buttons { display:flex; flex-wrap:wrap; gap:8px; }
   @media (max-width:520px) { .row { flex-wrap:wrap; } .actions { width:100%; } }`;
@@ -441,11 +452,13 @@ function doSwitch(port: number | null, res: Res): void {
 // What visitors get while "None" is selected.
 function renderIdle(res: Res): void {
   res.writeHead(503, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-  res.end(page('Nothing served', `<div class="card">
-  <span class="badge" style="background:var(--chip);color:var(--mute)">${icon('power', 18)}</span>
+  res.end(`${htmlHead('Nothing served')}</head><body><main class="empty">
+  <span class="halo">${icon('power', 26)}</span>
   <h1>Nothing is being served right now</h1>
-  <p class="sub" style="margin:0">This address isn't pointed at a server at the moment.</p>
-</div>`));
+  <p>This address isn't pointed at a server at the moment. Check back a little later.</p>
+</main>
+<footer class="empty-foot"><span class="mark">${icon('mark', 13)}</span>port-switch</footer>
+</body></html>`);
 }
 
 async function doAction(action: Action, name: string, res: Res): Promise<void> {
