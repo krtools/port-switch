@@ -14,7 +14,10 @@
     "portctl": "node dist/portctl.js",
     "proxy": "node dist/switch.js",
     "archive:sh": "sh scripts/archive.sh",
-    "archive:win": "scripts\\archive.cmd"
+    "archive:win": "scripts\\archive.cmd",
+    "dev": "node scripts/dev.js",
+    "dev:stop": "node scripts/dev.js stop",
+    "dev:ctl": "node scripts/dev.js ctl"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

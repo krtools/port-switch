@@ -155,6 +155,26 @@ yarn archive:sh     # build + release/port-switch-<version>.tar.gz (sh)
 yarn archive:win    # same, from cmd with Windows' tar
 ```
 
+### Trying things out: `yarn dev`
+
+`yarn dev` builds and runs port-switch against a sandbox in `.dev/` (its own `servers.json`, `.env` and `run/`, gitignored) with a set of demo servers from `scripts/dev-apps/`, then rebuilds and restarts the proxy whenever `src/` changes, keeping whichever server was selected. Open `http://localhost:4100/switch` (password `dev`). Ctrl+C stops everything.
+
+| Demo server | For trying |
+|---|---|
+| `site` | an app page with a live WebSocket, a 404 for unknown paths (`/missing`), and a redirect to `localhost:<port>` (`/redirect`) |
+| `chatty` | a steady colored log: levels, 256/true colors, `\r` progress bars, stack traces |
+| `slow-start` | takes 6s to listen: the "starting" state |
+| `crashy` | crashes after 8s: the exited state, restart markers, previous-run dividers |
+| `no-cmd` | an entry with no command: switchable, not startable |
+
+```sh
+yarn dev --detach    # start it all and return (for scripted checks)
+yarn dev:ctl status  # portctl against the dev setup (start crashy, switch none, logs chatty, ...)
+yarn dev:stop        # stop everything the dev setup started
+```
+
+`DEV_PORT` moves it off 4100 (the demo servers use the next five ports).
+
 `src/logClient.ts` runs in the browser: `switch.ts` inlines it into the viewer page with `toString()`, so it must stay self-contained (no imports, nothing from outside the function).
 
 ## License
