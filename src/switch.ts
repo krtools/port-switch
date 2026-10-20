@@ -461,19 +461,45 @@ function renderIdle(res: Res): void {
 </body></html>`);
 }
 
-async function doAction(action: Action, name: string, res: Res): Promise<void> {
+/** Start/stop/restart a server; resolves to an error message, or '' when it worked. */
+async function runAction(action: Action, name: string): Promise<string> {
   const entry = reloadConfig().servers.find((s) => s.name === name);
-  let msg = '';
   try {
     if (!entry) throw new Error(`unknown server "${name}"`);
     if (action !== 'start') await launcher.stop(entry);
     if (action !== 'stop') await launcher.start(entry);
     console.log(`[switch] ${action} ${name}`);
+    return '';
   } catch (err) {
-    msg = `${action} ${name}: ${errMsg(err)}`;
+    return `${action} ${name}: ${errMsg(err)}`;
   }
+}
+
+// The switch page's buttons: a form post, then back to the page (with any error).
+async function doAction(action: Action, name: string, res: Res): Promise<void> {
+  const msg = await runAction(action, name);
   res.writeHead(303, { location: SWITCH_PATH + (msg ? `?msg=${encodeURIComponent(msg)}` : ''), 'cache-control': 'no-store' });
   res.end();
+}
+
+const sendJson = (res: Res, status: number, body: object) => {
+  res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+  res.end(JSON.stringify(body));
+};
+
+// The log page's buttons: the same actions as JSON, so the page (and its stream) stays put.
+async function apiAction(action: Action, name: string, res: Res): Promise<void> {
+  const entry = reloadConfig().servers.find((s) => s.name === name);
+  if (!entry) return sendJson(res, 404, { ok: false, msg: `unknown server "${name}"` });
+  const msg = await runAction(action, name);
+  sendJson(res, msg ? 409 : 200, { ok: !msg, msg, state: (await launcher.getState(entry)).state });
+}
+
+async function apiServer(name: string, res: Res): Promise<void> {
+  const entry = reloadConfig().servers.find((s) => s.name === name);
+  if (!entry) return sendJson(res, 404, { msg: `unknown server "${name}"` });
+  const { state, pid } = await launcher.getState(entry);
+  sendJson(res, 200, { name, port: entry.port, state, pid, startable: !!entry.cmd });
 }
 
 // ---- logs ------------------------------------------------------------------
@@ -793,6 +819,11 @@ const LOG_STYLE = `
   .seg button[aria-pressed=true] { background:var(--acc-tint); color:var(--acc); }
   select.btn { padding:0 8px; }
   #nav { display:inline-flex; gap:2px; }
+  .topbar .tools { align-items:center; }
+  .srvstate { display:inline-flex; align-items:center; gap:7px; min-width:104px; justify-content:flex-end; font-size:12px; color:var(--mute); white-space:nowrap; }
+  .srvstate .dot { align-self:center; margin:0; }
+  #srv-main[data-action=start] .ic-restart, #srv-main[data-action=restart] .ic-start { display:none; }
+  .tsep { width:1px; height:20px; background:var(--line); margin:0 4px; }
   .count { font-size:12px; color:var(--mute); white-space:nowrap; } .count b { color:var(--fg); font-weight:500; }
   .qerr { font-size:12px; color:var(--danger); }
   .sdrop { position:relative; }
@@ -821,7 +852,17 @@ const LOG_STYLE = `
   #jump { position:fixed; z-index:5; display:none; height:22px; padding:0 8px; font-size:11px; box-shadow:0 2px 8px rgba(0,0,0,.35); }`;
 
 function renderLogViewer(res: Res, { title, streamUrl, combined, names }: { title: string; streamUrl: string; combined: boolean; names: string[] }): void {
-  const opts: LogClientOptions = { streamUrl, combined, names, tagWidth: Math.max(...names.map((n) => n.length)) };
+  // A single server's page (not the proxy's: stopping it would cut this page off) gets
+  // its own Start/Restart/Stop.
+  const control = !combined && config.servers.some((s) => s.name === names[0] && s.cmd) ? names[0] : null;
+  const opts: LogClientOptions = { streamUrl, combined, names, tagWidth: Math.max(...names.map((n) => n.length)), base: SWITCH_PATH, control };
+  const controls = control ? `<span class="srvstate" id="srv-state"><span class="dot off" id="srv-dot"></span><span id="srv-text">Checking</span></span>
+    <button class="btn sm" id="srv-main" data-action="restart" disabled>
+      <span class="ic-start">${icon('start', 13)}</span><span class="ic-restart">${icon('restart', 13)}</span>
+      <span class="swap"><span id="srv-main-label">Restart</span><span class="reserve" aria-hidden="true">Restart</span></span>
+    </button>
+    <button class="btn sm danger" id="srv-stop" disabled>${icon('stop', 13)}Stop</button>
+    <span class="tsep" aria-hidden="true"></span>` : '';
   const ctxOptions = [0, 1, 2, 3, 5, 10].map((n) => `<option value="${n}">${n ? `±${n} line${n > 1 ? 's' : ''}` : 'No context'}</option>`).join('');
   const json = JSON.stringify(opts).replace(/</g, '\\u003c');
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
@@ -831,6 +872,7 @@ function renderLogViewer(res: Res, { title, streamUrl, combined, names }: { titl
   <h1>${esc(title)}</h1>
   <span class="pill warn" id="conn"><i></i><span id="conn-text">Connecting</span></span>
   <div class="tools">
+    ${controls}
     <button class="btn" id="pause" aria-pressed="false">Pause</button>
     <button class="btn" id="wrap" aria-pressed="false">Wrap</button>
     <button class="btn" id="clear">Clear</button>
@@ -965,6 +1007,11 @@ async function handleSwitch(req: Req, res: Res, urlPath: string, query: string):
     if (parts[1] === 'stream' && parts.length === 2) return streamLogs(req, res, names, clampLines(query, 50));
     if (parts.length === 1) return renderLogViewer(res, { title: 'All logs', streamUrl: `${SWITCH_PATH}/logs/stream${linesParam(query)}`, combined: true, names });
   }
+  if (parts[0] === 'api' && parts.length === 3 && req.method === 'POST' && (ACTIONS as readonly string[]).includes(parts[1])) {
+    req.resume();
+    return apiAction(parts[1] as Action, parts[2], res);
+  }
+  if (parts[0] === 'api' && parts[1] === 'server' && parts.length === 3) return apiServer(parts[2], res);
   if (parts.join('/') === 'api/state') {
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     res.end(JSON.stringify({ target, name: nameOf(target), logStreams: openStreams.size, websockets: tunnels.size }));

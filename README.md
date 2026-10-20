@@ -56,6 +56,9 @@ To upgrade, extract a newer archive over the same folder. Archives never contain
 | `servers[].cmd` | optional | shell command that starts it; without it the server can be switched to but not started |
 | `servers[].cwd` | optional | working directory; `~` and paths relative to `servers.json`'s folder work |
 | `servers[].env` | optional | extra environment variables (`PORT` is always set to the server's port) |
+| `defaults.portEnv` | default `"PORT"` | environment variable each server gets its port in; `false` for none |
+| `defaults.color` | default `false` | `color` for every server that doesn't set its own |
+| `servers[].portEnv` | optional | this server's port variable instead of `defaults.portEnv` (e.g. `"VITE_PORT"`), or `false` |
 | `servers[].color` | optional | `true` sets `FORCE_COLOR=1` and `CLICOLOR_FORCE=1` so tools keep colors in the log; some tools need their own flag (e.g. `--color=always`) |
 
 The file is re-read whenever the switch page loads, so edits show up without a restart. If it's broken, the page shows the error and keeps using the last good version.
@@ -91,6 +94,7 @@ The proxy also reads `PORT`, `HOST` (default `0.0.0.0`) and `TARGET` (a port, or
 portctl                          status (the default)
 portctl start   [name...|--all]  start servers; picker if no name
 portctl stop    [name...|--all]
+portctl shutdown                 stop every server, then the proxy (= stop --all --self)
 portctl restart [name...|--all]
 portctl status  [name...]        exit code 3 if a named server isn't running
 portctl logs    [name] [-n N] [--no-follow] [--strip]
@@ -98,7 +102,7 @@ portctl switch  [name|port|none] point the running proxy at a server (none: serv
 portctl help    [command]        or: portctl <command> --help
 ```
 
-- `proxy` is the proxy itself (`--self` works too): `portctl start proxy`, `portctl logs proxy`. `--all` never includes it.
+- `proxy` is the proxy itself (`--self` works too): `portctl start proxy`, `portctl logs proxy`. `--all` leaves it out unless you add `--self`: `start --all --self` starts the proxy first, `stop --all --self` (or `portctl shutdown`) stops it last.
 - `stop` kills the whole process tree (SIGTERM to the group, SIGKILL after 3s; `taskkill /T /F` on Windows), so `npm run dev`-style wrappers don't leave the real server behind.
 - `--strip` removes color codes from `logs` output, for `grep` and `less`.
 

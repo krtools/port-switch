@@ -2,7 +2,10 @@
 // viewer -- levels, 256/true colors, a \r progress bar now and then, and stack traces.
 const http = require('http');
 
-const port = Number(process.env.PORT);
+// Started with "portEnv": "CHATTY_PORT" in yarn dev's servers.json, so that's where its port is.
+const port = Number(process.env.CHATTY_PORT);
+if (!port) { console.error('chatty: CHATTY_PORT is not set'); process.exit(1); }
+if (process.env.PORT) console.log(`(PORT is also set: ${process.env.PORT}, which it shouldn't be)`);
 const c = (code, s) => `\x1b[${code}m${s}\x1b[0m`;
 const stamp = () => c(90, new Date().toISOString().slice(11, 23));
 const lines = [

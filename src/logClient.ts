@@ -7,6 +7,8 @@ export interface LogClientOptions {
   combined: boolean; // tag each line with its server's name
   tagWidth: number;
   names: string[]; // servers in this view (the Servers dropdown in the combined view)
+  base: string; // the switch path, e.g. "/switch"
+  control: string | null; // server this page can start/stop/restart (single-server pages only)
 }
 
 interface Sgr {
@@ -578,6 +580,60 @@ export function logClient(opts: LogClientOptions): void {
     for (const st of Object.values(streams)) st.line = null;
     apply();
   };
+
+  // ---- Start / Restart / Stop (a single server's page) ------------------------------
+  // Fixed slots like the switch page: [Start|Restart] [Stop], disabled where they don't apply.
+  if (opts.control) {
+    const name = opts.control;
+    const api = `${opts.base}/api`;
+    const dot = $('srv-dot');
+    const text = $('srv-text');
+    const main = $<HTMLButtonElement>('srv-main');
+    const mainLabel = $('srv-main-label');
+    const stop = $<HTMLButtonElement>('srv-stop');
+    const LOOK: Record<string, [string, string]> = {
+      running: ['ok', 'Running'], starting: ['warn', 'Starting'], stopped: ['off', 'Stopped'], external: ['ext', 'External'],
+    };
+    let state = '';
+    let busy = '';
+    const show = () => {
+      const up = state === 'running' || state === 'starting';
+      const [cls, label] = LOOK[state] || ['off', '…'];
+      dot.className = `dot ${busy ? 'warn' : cls}`;
+      text.textContent = busy || label;
+      main.dataset.action = up ? 'restart' : 'start';
+      main.className = `btn sm${up ? '' : ' primary'}`;
+      mainLabel.textContent = up ? 'Restart' : 'Start';
+      main.disabled = !!busy || !state || state === 'external';
+      stop.disabled = !!busy || !up;
+      main.title = state === 'external' ? 'Something portctl didn\'t start is using this port' : '';
+    };
+    const poll = async () => {
+      try {
+        const r = await fetch(`${api}/server/${encodeURIComponent(name)}`, { cache: 'no-store' });
+        if (r.ok) { state = (await r.json()).state; show(); }
+      } catch {}
+    };
+    const act = async (action: string) => {
+      busy = { start: 'Starting…', stop: 'Stopping…', restart: 'Restarting…' }[action] || '…';
+      show();
+      try {
+        const r = await fetch(`${api}/${action}/${encodeURIComponent(name)}`, { method: 'POST' });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok || !body.ok) sysLine(name, `— ${name}: ${body.msg || `${action} failed (${r.status === 401 ? 'logged out: reload' : r.status})`} —`);
+        if (body.state) state = body.state;
+      } catch {
+        sysLine(name, `— ${name}: ${action} failed: the proxy didn't answer —`);
+      }
+      busy = '';
+      show();
+      setTimeout(poll, 600); // "starting" usually turns into "running" a moment later
+    };
+    main.onclick = () => act(main.dataset.action || 'start');
+    stop.onclick = () => act('stop');
+    poll();
+    setInterval(() => { if (!busy) poll(); }, 3000);
+  }
 
   compile();
   apply();

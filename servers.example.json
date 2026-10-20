@@ -1,8 +1,9 @@
 {
   "proxy": { "port": 3000, "path": "/switch" },
   "logs": { "keep": 5 },
+  "defaults": { "portEnv": "PORT", "color": false },
   "servers": [
-    { "name": "app-one", "port": 3001, "cwd": "~/code/app-one", "cmd": "npm run dev -- --port 3001", "color": true },
+    { "name": "app-one", "port": 3001, "cwd": "~/code/app-one", "cmd": "npm run dev", "portEnv": "VITE_PORT", "color": true },
     { "name": "app-two", "port": 3002, "cwd": "~/code/app-two", "cmd": "python3 -m http.server 3002" }
   ]
 }

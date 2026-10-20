@@ -23,10 +23,10 @@ const PASSWORD = 'dev';
 const AUTOSTART = ['site', 'chatty', 'slow-start'];
 
 const servers = [
-  { name: 'site', port: BASE + 1, cwd: '../scripts/dev-apps', cmd: 'node site.js', color: true },
-  { name: 'chatty', port: BASE + 2, cwd: '../scripts/dev-apps', cmd: 'node chatty.js', color: true },
-  { name: 'slow-start', port: BASE + 3, cwd: '../scripts/dev-apps', cmd: 'node slow.js' },
-  { name: 'crashy', port: BASE + 4, cwd: '../scripts/dev-apps', cmd: 'node crashy.js', color: true },
+  { name: 'site', port: BASE + 1, cwd: '../scripts/dev-apps', cmd: 'node site.js' },
+  { name: 'chatty', port: BASE + 2, cwd: '../scripts/dev-apps', cmd: 'node chatty.js', portEnv: 'CHATTY_PORT' }, // its own port variable
+  { name: 'slow-start', port: BASE + 3, cwd: '../scripts/dev-apps', cmd: 'node slow.js', color: false },
+  { name: 'crashy', port: BASE + 4, cwd: '../scripts/dev-apps', cmd: 'node crashy.js' },
   { name: 'no-cmd', port: BASE + 5 }, // can be switched to, not started
 ];
 
@@ -37,7 +37,7 @@ const portctl = (args, extra = {}) =>
 function setup() {
   fs.mkdirSync(DEV, { recursive: true });
   // Rewritten every run so it tracks the demo list above; .env is only created once.
-  fs.writeFileSync(CONFIG, `${JSON.stringify({ proxy: { port: BASE, path: '/switch' }, logs: { keep: 3 }, servers }, null, 2)}\n`);
+  fs.writeFileSync(CONFIG, `${JSON.stringify({ proxy: { port: BASE, path: '/switch' }, logs: { keep: 3 }, defaults: { portEnv: 'PORT', color: true }, servers }, null, 2)}\n`);
   const envFile = path.join(DEV, '.env');
   if (!fs.existsSync(envFile)) fs.writeFileSync(envFile, `SWITCH_PASSWORD=${PASSWORD}\n`);
 }
@@ -48,8 +48,7 @@ function build() {
 }
 
 function stopAll() {
-  portctl(['stop', '--all']);
-  portctl(['stop', 'proxy']);
+  portctl(['shutdown']);
 }
 
 function banner() {

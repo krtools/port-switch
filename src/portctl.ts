@@ -40,11 +40,19 @@ export interface ServerEntry {
   cwd?: string;
   env?: Record<string, string>;
   color?: boolean;
+  /** Environment variable that gets the port; false = none. Resolved from defaults. */
+  portEnv?: string | false;
+}
+
+export interface Defaults {
+  portEnv: string | false;
+  color: boolean;
 }
 
 export interface Config {
   proxy: { port: number; path: string };
   logs: { keep: number };
+  defaults: Defaults;
   servers: ServerEntry[];
 }
 
@@ -80,6 +88,7 @@ commands:
   status  [name...]               show servers (the default with no command)
   start   [name...|--all]         start servers
   stop    [name...|--all]         stop servers
+  shutdown                        stop every server, then the proxy (= stop --all --self)
   restart [name...|--all]         restart servers (starts them if stopped)
   logs    [name] [-n N] [--no-follow] [--strip]
                                   show and follow a server's log
@@ -91,10 +100,13 @@ Commands that take names show a picker when no name is given.
 --config FILE (anywhere on the line), or PORT_SWITCH_CONFIG=FILE: use that servers.json.
 .env, run/ and relative "cwd" paths are then taken from FILE's folder as well.
 
-servers.json entries: name, port, cmd, and optionally cwd, env, color.
+servers.json entries: name, port, cmd, and optionally cwd, env, color, portEnv.
 "color": true sets FORCE_COLOR=1 and CLICOLOR_FORCE=1 so tools keep their colors
 even though their output goes to a log file (some tools need their own flag too).
-"${PROXY}" is the proxy itself (switch.js); --self is an alias. --all never includes it.
+"portEnv" names the variable that gets the port (default PORT; false for none).
+A top-level "defaults": { "portEnv": ..., "color": ... } sets both for every server.
+"${PROXY}" is the proxy itself (switch.js); --self is an alias. --all leaves it out
+unless --self is given too (portctl shutdown stops everything).
 
 files: ${CONFIG_FILE}
        ${ENV_FILE}  (SWITCH_PASSWORD for the /switch page)
@@ -119,7 +131,7 @@ Start servers in the background and wait (up to 15s) for their ports to answer.
 If one exits right away, the end of its log is printed.
 
   name...   one or more servers (or "${PROXY}"); picker if omitted
-  --all     every server that is stopped (not the proxy)
+  --all     every server that is stopped (add --self for the proxy too, started first)
 
 Output goes to run/<name>.log. The previous run's log is kept as run/<name>.log.1,
 the one before as .2, and so on, up to "logs": { "keep": N } in servers.json (default 5),
@@ -132,14 +144,19 @@ Stop servers, including any child processes they started. Sends SIGTERM to the
 process group, then SIGKILL after 3s (on Windows: taskkill /T /F).
 
   name...   one or more servers (or "${PROXY}"); picker if omitted
-  --all     every running server (not the proxy)`,
+  --all     every running server (add --self for the proxy too, stopped last)`,
+
+  shutdown: `usage: portctl shutdown
+
+Stop every server, then the proxy: the same as portctl stop --all --self.`,
 
   restart: `usage: portctl restart [name...|--all]
 
 Stop then start servers. A stopped server is just started.
 
   name...   one or more servers (or "${PROXY}"); picker if omitted
-  --all     every server with a "cmd", except ports in use by something else (not the proxy)`,
+  --all     every server with a "cmd", except ports in use by something else
+            (add --self for the proxy too, restarted first)`,
 
   logs: `usage: portctl logs [name] [-n N] [--no-follow] [--strip]
 
@@ -179,6 +196,7 @@ export function loadConfig(): Config {
   if (!isObject(raw)) throw new Error('servers.json: must be a JSON object');
   if (raw.proxy !== undefined && !isObject(raw.proxy)) throw new Error('servers.json: "proxy" must be an object');
   if (raw.logs !== undefined && !isObject(raw.logs)) throw new Error('servers.json: "logs" must be an object');
+  if (raw.defaults !== undefined && !isObject(raw.defaults)) throw new Error('servers.json: "defaults" must be an object');
   if (raw.servers !== undefined && !Array.isArray(raw.servers)) throw new Error('servers.json: "servers" must be a list');
 
   const proxy = { port: 3000, path: '/switch', ...raw.proxy };
@@ -197,12 +215,21 @@ export function loadConfig(): Config {
     throw new Error('servers.json: logs.keep must be a whole number from 0 to 100');
   }
 
+  // "defaults": what every server gets unless it says otherwise.
+  const defaults: Defaults = { portEnv: 'PORT', color: false };
+  const rawDefaults = (raw.defaults ?? {}) as Record<string, unknown>;
+  if (rawDefaults.portEnv !== undefined) defaults.portEnv = checkPortEnv(rawDefaults.portEnv, 'servers.json defaults');
+  if (rawDefaults.color !== undefined) {
+    if (typeof rawDefaults.color !== 'boolean') throw new Error('servers.json defaults: "color" must be true or false');
+    defaults.color = rawDefaults.color;
+  }
+
   const names = new Set<string>();
   const ports = new Set<number>([proxy.port]);
   const servers = ((raw.servers as unknown[] | undefined) ?? []).map((s, i): ServerEntry => {
     const where = `servers.json servers[${i}]`;
     if (!isObject(s)) throw new Error(`${where}: must be an object`);
-    const { name, port, cmd, cwd, env, color } = s;
+    const { name, port, cmd, cwd, env, color, portEnv } = s;
     if (typeof name !== 'string' || !/^\w[\w.-]*$/.test(name)) {
       throw new Error(`${where}: "name" must be letters, digits, _ . - (not starting with . or -)`);
     }
@@ -218,9 +245,21 @@ export function loadConfig(): Config {
     }
     names.add(name);
     ports.add(port);
-    return { name, port, cmd, cwd, env: env as Record<string, string> | undefined, color };
+    return {
+      name, port, cmd, cwd,
+      env: env as Record<string, string> | undefined,
+      color: color ?? defaults.color,
+      portEnv: portEnv === undefined ? defaults.portEnv : checkPortEnv(portEnv, where),
+    };
   });
-  return { proxy: proxy as Config['proxy'], logs: logs as Config['logs'], servers };
+  return { proxy: proxy as Config['proxy'], logs: logs as Config['logs'], defaults, servers };
+}
+
+/** "portEnv": an environment variable name, or false for none. */
+function checkPortEnv(v: unknown, where: string): string | false {
+  if (v === false) return false;
+  if (typeof v === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(v)) return v;
+  throw new Error(`${where}: "portEnv" must be an environment variable name (like "PORT") or false`);
 }
 
 function proxyEntry(config: Config): ServerEntry {
@@ -333,9 +372,18 @@ export async function start(entry: ServerEntry): Promise<number> {
   rotateLog(entry.name, loadConfig().logs.keep);
   fs.writeFileSync(logFile(entry.name), `# ${new Date().toISOString()}  (cwd ${cwd})\n$ ${entry.cmd}\n`);
   const log = fs.openSync(logFile(entry.name), 'a');
-  const env: NodeJS.ProcessEnv = { ...process.env, ...(entry.color && COLOR_ENV), ...entry.env, PORT: String(entry.port) };
-  if (entry.name === PROXY) env.PORT_SWITCH_CONFIG = CONFIG_FILE; // the proxy uses the same config
-  else for (const k of [...ENV_KEYS, 'PORT_SWITCH_CONFIG']) delete env[k];
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (entry.name === PROXY) {
+    env.PORT = String(entry.port); // switch.js listens on PORT
+    env.PORT_SWITCH_CONFIG = CONFIG_FILE; // and uses the same config
+  } else {
+    // Nothing of the proxy's own leaks in: its secrets, its config path, and its PORT/TARGET
+    // (servers started from the switch page inherit the proxy's environment).
+    for (const k of [...ENV_KEYS, 'PORT_SWITCH_CONFIG', 'PORT', 'TARGET']) delete env[k];
+    if (entry.color) Object.assign(env, COLOR_ENV);
+    Object.assign(env, entry.env);
+    if (entry.portEnv) env[entry.portEnv] = String(entry.port);
+  }
   const opts: SpawnOptions = {
     cwd,
     detached: true, // own process group, survives this process / the SSH session
@@ -450,7 +498,15 @@ async function runEach(cmd: ActionName, entries: ServerEntry[]): Promise<void> {
   });
 }
 
-async function runAll(config: Config, cmd: ActionName): Promise<void> {
+/** --all: every server with a cmd. withProxy (--all --self) adds the proxy: started first,
+ *  stopped last, so the switch page is up for as long as anything else is. */
+async function runAll(config: Config, cmd: ActionName, withProxy = false): Promise<void> {
+  if (withProxy && cmd !== 'stop') await runEach(cmd, [proxyEntry(config)]);
+  await runServers(config, cmd);
+  if (withProxy && cmd === 'stop') await runEach(cmd, [proxyEntry(config)]);
+}
+
+async function runServers(config: Config, cmd: ActionName): Promise<void> {
   const entries = config.servers.filter((e) => e.cmd);
   const states = await Promise.all(entries.map(getState));
   const want: Record<ActionName, (s: ServerState) => boolean> = {
@@ -625,10 +681,12 @@ async function main(argv: string[]): Promise<void> {
   if (!cmd || cmd === 'status') return cliStatus(config, resolveNames(config, opts.names));
   const pickCmd = cmd as PickCmd;
 
+  if (cmd === 'shutdown') return runAll(config, 'stop', true);
   if (opts.all) {
     if (!isAction(pickCmd)) throw new Error(`--all doesn't apply to ${cmd}`);
-    if (opts.names.length) throw new Error('give names or --all, not both');
-    return runAll(config, pickCmd);
+    const withProxy = opts.names.length > 0 && opts.names.every((n) => n === PROXY || n === 'self');
+    if (opts.names.length && !withProxy) throw new Error('give names or --all, not both (--all --self also includes the proxy)');
+    return runAll(config, pickCmd, withProxy);
   }
   if (pickCmd === 'switch' && (/^\d+$/.test(opts.names[0] || '') || opts.names[0] === NONE)) {
     if (opts.names.length > 1) throw new Error('switch takes one name or port');
