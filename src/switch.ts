@@ -820,8 +820,12 @@ const LOG_STYLE = `
   select.btn { padding:0 8px; }
   #nav { display:inline-flex; gap:2px; }
   .topbar .tools { align-items:center; }
-  .srvstate { display:inline-flex; align-items:center; gap:7px; min-width:104px; justify-content:flex-end; font-size:12px; color:var(--mute); white-space:nowrap; }
-  .srvstate .dot { align-self:center; margin:0; }
+  .srvstate { display:inline-flex; align-items:center; gap:7px; min-width:104px; justify-content:flex-end; margin-right:8px;
+              font-size:12px; line-height:1; color:var(--mute); white-space:nowrap; }
+  /* The dot as its own 8px box centred by flex, not an inline sitting on the text baseline
+     (which put it below the middle of "Running"). */
+  .srvstate .dot { display:block; width:8px; height:8px; margin:0; align-self:center; }
+  .srvstate .dot::before { display:block; vertical-align:initial; }
   #srv-main[data-action=start] .ic-restart, #srv-main[data-action=restart] .ic-start { display:none; }
   .tsep { width:1px; height:20px; background:var(--line); margin:0 4px; }
   .count { font-size:12px; color:var(--mute); white-space:nowrap; } .count b { color:var(--fg); font-weight:500; }
