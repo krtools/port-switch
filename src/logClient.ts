@@ -183,10 +183,12 @@ export function logClient(opts: LogClientOptions): void {
 
   // ---- run markers ---------------------------------------------------------
   const sameDay = (a: Date, b: Date) => a.toDateString() === b.toDateString();
+  /** "2026-10-20 17:05:23" in the viewer's time zone; just the time if it's the same day as `ref`. */
   const when = (iso: string, ref?: Date): string => {
     const d = new Date(iso);
-    const time = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit' });
-    return ref && sameDay(d, ref) ? time : `${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}, ${time}`;
+    const p = (n: number) => String(n).padStart(2, '0');
+    const time = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    return ref && sameDay(d, ref) ? time : `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${time}`;
   };
   const duration = (ms: number): string => {
     const s = Math.max(0, Math.round(ms / 1000));
