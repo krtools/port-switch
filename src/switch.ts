@@ -71,27 +71,31 @@ const SWITCH_PATH = config.proxy.path;
 const LISTEN_PORT = Number(process.env.PORT) || config.proxy.port;
 const LISTEN_HOST = process.env.HOST || '0.0.0.0';
 
-// The port being proxied to, or null for "None": every request gets the idle page.
-// It survives restarts: saved to run/proxy.json on every switch and read back here.
-// TARGET in the environment wins; with neither, the first server in servers.json.
-function savedTarget(): { target: number | null } | undefined {
-  try {
-    const { target: t } = JSON.parse(fs.readFileSync(launcher.PROXY_STATE_FILE, 'utf8'));
-    if (t === null || (Number.isInteger(t) && t > 0 && t < 65536)) return { target: t };
-  } catch {}
-  return undefined;
+// What the proxy remembers across restarts (run/proxy.json): the selected server and
+// whether requests are logged. Written on every change, read back here.
+function savedState(): { target?: number | null; logRequests?: boolean } {
+  let s: Record<string, unknown> = {};
+  try { s = JSON.parse(fs.readFileSync(launcher.PROXY_STATE_FILE, 'utf8')); } catch { return {}; }
+  const t = s.target;
+  return {
+    target: t === null || (Number.isInteger(t) && (t as number) > 0 && (t as number) < 65536) ? (t as number | null) : undefined,
+    logRequests: typeof s.logRequests === 'boolean' ? s.logRequests : undefined,
+  };
 }
-function saveTarget(): void {
+function saveState(): void {
   const file = launcher.PROXY_STATE_FILE;
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(`${file}.tmp`, `${JSON.stringify({ target })}\n`);
+    fs.writeFileSync(`${file}.tmp`, `${JSON.stringify({ target, logRequests })}\n`);
     fs.renameSync(`${file}.tmp`, file); // a crash mid-write can't leave a half-written file
   } catch (err) {
-    console.error(`[switch] couldn't save the selection to ${file}: ${errMsg(err)}`);
+    console.error(`[switch] couldn't save state to ${file}: ${errMsg(err)}`);
   }
 }
-const saved = savedTarget();
+const state = savedState();
+const saved = state.target === undefined ? undefined : { target: state.target };
+// Request logging: off unless it was switched on (switch page toggle, portctl requests on).
+let logRequests = state.logRequests ?? false;
 const fromEnv = process.env.TARGET;
 // With nothing saved (first start, or the file is unreadable) it's None: nothing gets
 // exposed until a server is picked on purpose.
@@ -292,6 +296,13 @@ const STYLE = `
   input { font:inherit; height:30px; padding:0 10px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); min-width:0; }
   input:focus { outline:none; border-color:var(--acc); box-shadow:var(--ring); }
   .other { display:flex; align-items:center; gap:8px; margin-top:14px; } .other label { color:var(--mute); font-size:13px; } .other input { flex:1; }
+  .setting { display:flex; align-items:center; gap:14px; margin-top:20px; padding:12px 14px; background:var(--card); border:1px solid var(--line); border-radius:10px; }
+  .setting-text { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
+  .setting-title { font-weight:500; } .setting-hint { font-size:12px; color:var(--mute); }
+  .toggle { flex:none; position:relative; width:36px; height:20px; padding:0; border:0; border-radius:999px; background:var(--line-strong); cursor:pointer; transition:background .15s; }
+  .toggle::after { content:""; position:absolute; top:2px; left:2px; width:16px; height:16px; border-radius:50%; background:#fff; box-shadow:0 1px 2px rgba(0,0,0,.25); transition:transform .15s; }
+  .toggle[aria-checked=true] { background:var(--acc); } .toggle[aria-checked=true]::after { transform:translateX(16px); }
+  @media (prefers-reduced-motion:reduce) { .toggle, .toggle::after { transition:none; } }
   .msg { background:var(--danger-tint); color:var(--danger); border-radius:8px; padding:10px 12px; margin:0 0 14px; font-size:13px; white-space:pre-wrap; }
   .card { max-width:380px; margin:72px auto 0; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:24px; }
   .card h1 { font-size:17px; margin:12px 0 4px; }
@@ -424,7 +435,14 @@ async function renderSwitchPage(res: Res, msg: string | null): Promise<void> {
 <p class="sub">${target === null ? 'Not proxying anything: visitors see a placeholder page'
     : `Proxying to <b>${esc(nameOf(target))}</b> <span class="mono">:${target}</span>`}</p>
 ${errors.map((m) => `<p class="msg">${esc(m)}</p>`).join('')}
-<div class="list">${noneRow}${rows}</div>${custom}`, { head, nav: true }));
+<div class="list">${noneRow}${rows}</div>${custom}
+<form class="setting" method="post" action="${SWITCH_PATH}/log-requests/${logRequests ? 'off' : 'on'}">
+  <div class="setting-text">
+    <span class="setting-title">Log requests</span>
+    <span class="setting-hint">Every request, with the client's IP and forwarding headers, goes to the <a href="${SWITCH_PATH}/log/${launcher.PROXY}">proxy log</a>.</span>
+  </div>
+  <button class="toggle" role="switch" aria-checked="${logRequests}" aria-label="Log requests" title="Turn request logging ${logRequests ? 'off' : 'on'}"></button>
+</form>`, { head, nav: true }));
 }
 
 /** Switch to a port, or to null ("None"). Responds with a redirect: to the site for a port,
@@ -441,7 +459,7 @@ function doSwitch(port: number | null, res: Res): void {
   if (port !== target) {
     console.log(`[switch] ${describe(target)} -> ${describe(port)}`);
     target = port;
-    saveTarget();
+    saveState();
     for (const s of tunnels) s.destroy();
     tunnels.clear();
   }
@@ -917,6 +935,49 @@ function renderLogViewer(res: Res, { title, streamUrl, combined, names }: { titl
 </body></html>`);
 }
 
+// ---- request log -------------------------------------------------------------
+const header = (req: Req, name: string): string => {
+  const v = req.headers[name];
+  return (Array.isArray(v) ? v.join(', ') : v || '').trim();
+};
+
+/** Who sent a request: behind a reverse proxy, the first X-Forwarded-For hop (or X-Real-IP),
+ *  with the raw headers and the actual peer alongside, since a client can put anything in
+ *  X-Forwarded-For itself; otherwise just the peer's address. */
+function whoFrom(req: Req): string {
+  const peer = (req.socket.remoteAddress || '?').replace(/^::ffff:/, '');
+  const xff = header(req, 'x-forwarded-for');
+  const xri = header(req, 'x-real-ip');
+  if (!xff && !xri) return peer;
+  const client = xff ? xff.split(',')[0].trim() : xri;
+  const details = [xff && `x-forwarded-for: ${xff}`, xri && `x-real-ip: ${xri}`, `peer ${peer}`].filter(Boolean).join(', ');
+  return `${client} (${details})`;
+}
+const userAgent = (req: Req): string => {
+  const ua = header(req, 'user-agent');
+  return ua ? ` ua="${ua.length > 120 ? `${ua.slice(0, 120)}…` : ua}"` : '';
+};
+
+/** With logging on: one line per request, written when it ends (so it has the status and
+ *  how long it took). The log pages' own status polling is left out. */
+function logRequest(req: Req, res: Res, to: string): void {
+  if (!logRequests) return;
+  const urlPath = (req.url ?? '/').split('?')[0];
+  if (urlPath === `${SWITCH_PATH}/api/state` || urlPath.startsWith(`${SWITCH_PATH}/api/server/`)) return;
+  const t0 = Date.now();
+  const who = whoFrom(req); // now: once the client is gone its address can't be read
+  res.on('close', () => {
+    const status = res.writableFinished ? String(res.statusCode) : `${res.headersSent ? res.statusCode : '-'} (client left)`;
+    console.log(`[req] ${req.method} ${req.url} -> ${to} ${status} ${Date.now() - t0}ms from ${who}`);
+  });
+}
+
+function setLogRequests(on: boolean): void {
+  if (on !== logRequests) console.log(`[switch] request log ${on ? 'on' : 'off'}`);
+  logRequests = on;
+  saveState();
+}
+
 // ---- proxy -----------------------------------------------------------------
 // Rewrite absolute redirects to localhost (e.g. http://localhost:3001/login) into
 // relative ones so they survive the outer HTTPS proxy.
@@ -974,7 +1035,7 @@ function proxy(req: Req, res: Res, retry = true): void {
       return;
     }
     if (res.destroyed) return; // the client already left; nothing to report to
-    console.log(`[proxy] ${req.method} ${req.url} -> :${port}: ${errText(err)}${res.headersSent ? ' (mid-response)' : ''}`);
+    console.log(`[proxy] ${req.method} ${req.url} -> :${port}: ${errText(err)}${res.headersSent ? ' (mid-response)' : ''} from ${whoFrom(req)}`);
     badGateway(res, port, err);
   });
   // The client went away first: drop the upstream request.
@@ -1016,9 +1077,22 @@ async function handleSwitch(req: Req, res: Res, urlPath: string, query: string):
     return apiAction(parts[1] as Action, parts[2], res);
   }
   if (parts[0] === 'api' && parts[1] === 'server' && parts.length === 3) return apiServer(parts[2], res);
+  // Request log on/off: the switch page's toggle (form post, back to the page) and portctl requests (JSON).
+  if (parts.length === 2 && parts[0] === 'log-requests' && req.method === 'POST' && ['on', 'off'].includes(parts[1])) {
+    req.resume();
+    setLogRequests(parts[1] === 'on');
+    res.writeHead(303, { location: SWITCH_PATH, 'cache-control': 'no-store' });
+    res.end();
+    return;
+  }
+  if (parts.length === 3 && parts[0] === 'api' && parts[1] === 'log-requests' && req.method === 'POST' && ['on', 'off'].includes(parts[2])) {
+    req.resume();
+    setLogRequests(parts[2] === 'on');
+    return sendJson(res, 200, { logRequests });
+  }
   if (parts.join('/') === 'api/state') {
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-    res.end(JSON.stringify({ target, name: nameOf(target), logStreams: openStreams.size, websockets: tunnels.size }));
+    res.end(JSON.stringify({ target, name: nameOf(target), logRequests, logStreams: openStreams.size, websockets: tunnels.size }));
     return;
   }
   res.writeHead(404, { 'content-type': 'text/plain' });
@@ -1027,7 +1101,9 @@ async function handleSwitch(req: Req, res: Res, urlPath: string, query: string):
 
 function route(req: Req, res: Res): void {
   const [urlPath, query = ''] = (req.url ?? '/').split('?');
-  if (urlPath === SWITCH_PATH || urlPath.startsWith(SWITCH_PATH + '/')) {
+  const ours = urlPath === SWITCH_PATH || urlPath.startsWith(SWITCH_PATH + '/');
+  logRequest(req, res, ours ? 'port-switch' : target === null ? 'none' : `:${target}`);
+  if (ours) {
     handleSwitch(req, res, urlPath, query).catch((err) => {
       console.error('[switch]', err);
       if (!res.headersSent) res.writeHead(500);
@@ -1081,7 +1157,7 @@ function tunnelWebSocket(req: Req, socket: Duplex, head: Buffer): void {
   const decline = (status: number, why: string) => {
     if (settled) return;
     settled = true;
-    console.log(`[proxy] websocket ${req.url} -> :${port}: ${why}`);
+    console.log(`[proxy] websocket ${req.url} -> :${port}: ${why} from ${whoFrom(req)}${userAgent(req)}`);
     closeWith(socket, status);
   };
   up.on('timeout', () => up.destroy(new Error('no answer within 5s')));
@@ -1099,11 +1175,20 @@ function tunnelWebSocket(req: Req, socket: Duplex, head: Buffer): void {
     if (head.length) upSocket.write(head);
     // Small messages (HMR updates) go out at once; dead peers on either side get noticed.
     for (const s of [socket as net.Socket, upSocket]) { s.setNoDelay(true); s.setKeepAlive(true, 30000); }
-    const close = () => { upSocket.destroy(); socket.destroy(); tunnels.delete(socket); };
+    const opened = Date.now();
+    const who = whoFrom(req);
+    let closed = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      upSocket.destroy(); socket.destroy(); tunnels.delete(socket);
+      if (logRequests) console.log(`[req] websocket ${req.url} -> :${port} 101, open ${fmtDuration(Date.now() - opened)}, from ${who}`);
+    };
     tunnels.add(socket);
-    upSocket.on('error', close);
-    upSocket.on('close', close);
-    socket.on('close', close);
+    // "end" counts too: upgraded sockets are half-open, so a client hanging up only ends its
+    // side, and waiting for "close" kept the tunnel (and the app's socket) open until the
+    // app happened to close it. WebSockets don't use half-closed connections.
+    for (const s of [socket, upSocket]) { s.on('error', close); s.on('end', close); s.on('close', close); }
     socket.pipe(upSocket).pipe(socket);
   });
   socket.on('close', () => { if (!settled) up.destroy(); });

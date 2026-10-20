@@ -72,7 +72,8 @@ servers.json
 .env           SWITCH_PASSWORD and other settings
 run/<name>.pid
 run/<name>.log, <name>.log.1, .2, ...   current and previous runs
-run/proxy.json  the selected server, restored when the proxy restarts (until there is one: None)
+run/proxy.json  the selected server and the request-log setting, restored when the proxy restarts
+                (no selection saved yet: None)
 ```
 
 ### .env
@@ -95,6 +96,7 @@ portctl                          status (the default)
 portctl start   [name...|--all]  start servers; picker if no name
 portctl stop    [name...|--all]
 portctl shutdown                 stop every server, then the proxy (= stop --all --self)
+portctl requests [on|off]        log every request, with the client's IP, to the proxy log
 portctl restart [name...|--all]
 portctl status  [name...]        exit code 3 if a named server isn't running
 portctl logs    [name] [-n N] [--no-follow] [--strip]
@@ -145,6 +147,7 @@ The filter bar (`Ctrl+F`) searches the lines on screen as they stream in:
 - All apps share one browser origin, so they share cookies, localStorage and service workers. A service worker from one app can interfere with another.
 - Absolute redirects to `localhost:<port>` are rewritten to relative ones, and requests reach your servers with `Host: localhost:<port>` (the original is in `X-Forwarded-Host`), which keeps dev-server host checks happy.
 - Idle client connections stay open 150s, longer than common outer proxies keep theirs, to avoid occasional 502s from connection reuse races.
+- **Request log** (the switch page's *Log requests* toggle, or `portctl requests on`): one line per request in the proxy log, written when it ends: `[req] GET /main.js -> :3001 200 12ms from 203.0.113.7 (x-forwarded-for: 203.0.113.7, peer 127.0.0.1)`. Behind a reverse proxy the client is the first `X-Forwarded-For` hop, shown with the raw headers and the real peer since a client can set that header itself. WebSockets get a line when they close; the log pages' own status polling is left out. WebSockets the app turns down, and requests that fail, are logged with who sent them (and the User-Agent) either way.
 - The proxy log (`portctl logs proxy`, or **Proxy log** on the switch page) timestamps every line, records requests it couldn't pass through, and records why the proxy exited. A log that just stops means it was killed with SIGKILL (e.g. the OOM killer).
 - Servers started by `portctl` are not restarted if they crash or the box reboots.
 

@@ -89,6 +89,7 @@ commands:
   start   [name...|--all]         start servers
   stop    [name...|--all]         stop servers
   shutdown                        stop every server, then the proxy (= stop --all --self)
+  requests [on|off]               log every request (with client IP) to the proxy log
   restart [name...|--all]         restart servers (starts them if stopped)
   logs    [name] [-n N] [--no-follow] [--strip]
                                   show and follow a server's log
@@ -145,6 +146,14 @@ process group, then SIGKILL after 3s (on Windows: taskkill /T /F).
 
   name...   one or more servers (or "${PROXY}"); picker if omitted
   --all     every running server (add --self for the proxy too, stopped last)`,
+
+  requests: `usage: portctl requests [on|off]
+
+Turn the proxy's request log on or off (same as the toggle on the switch page), or show
+whether it's on. With it on, every request goes to the proxy log (portctl logs proxy):
+method, path, which server it went to, status, time taken, and who sent it -- the client's
+IP, and X-Forwarded-For / X-Real-IP plus the connecting peer when behind a reverse proxy.
+The setting is kept in run/proxy.json, so it survives restarts.`,
 
   shutdown: `usage: portctl shutdown
 
@@ -332,10 +341,10 @@ export function tail(name: string, lines = 40): string {
 }
 
 /** GET a path on the running proxy. */
-function proxyRequest(config: Config, urlPath: string): Promise<{ status: number; body: string }> {
+function proxyRequest(config: Config, urlPath: string, method = 'GET'): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const headers: http.OutgoingHttpHeaders = process.env.SWITCH_PASSWORD ? { authorization: `Bearer ${process.env.SWITCH_PASSWORD}` } : {};
-    const req = http.get({ host: '127.0.0.1', port: config.proxy.port, path: urlPath, headers, timeout: 1500 }, (res) => {
+    const req = http.request({ host: '127.0.0.1', port: config.proxy.port, path: urlPath, method, headers, timeout: 1500 }, (res) => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (c: string) => { body += c; });
@@ -343,10 +352,11 @@ function proxyRequest(config: Config, urlPath: string): Promise<{ status: number
     });
     req.on('timeout', () => req.destroy(new Error('timeout')));
     req.on('error', reject);
+    req.end();
   });
 }
 
-async function proxyState(config: Config): Promise<{ target: number | null; name: string } | null> {
+async function proxyState(config: Config): Promise<{ target: number | null; name: string; logRequests?: boolean } | null> {
   try {
     const res = await proxyRequest(config, `${config.proxy.path}/api/state`);
     return res.status === 200 ? JSON.parse(res.body) : null;
@@ -533,7 +543,7 @@ async function cliStatus(config: Config, named: ServerEntry[]): Promise<void> {
   const [states, ps] = await Promise.all([Promise.all(entries.map(getState)), proxyState(config)]);
   const rows = entries.map((e, i) => {
     const s = states[i];
-    const note = e.name === PROXY ? (!ps ? '' : ps.target === null ? '-> none (not proxying)' : `-> ${ps.name} (:${ps.target})`)
+    const note = e.name === PROXY ? (!ps ? '' : (ps.target === null ? '-> none (not proxying)' : `-> ${ps.name} (:${ps.target})`) + (ps.logRequests ? ', logging requests' : ''))
       : ps?.target === e.port ? '* active'
         : s.state === 'external' ? '(port in use, not ours)' : '';
     return [e.name, e.port, s.state, s.pid || '-', s.pid ? uptime(e.name) : '-', note];
@@ -584,6 +594,20 @@ function cliLogs(entry: ServerEntry, { lines, follow, strip }: Options): void {
 }
 
 /** Point the proxy at a port, or at nothing (null = "none"). */
+async function cliRequests(config: Config, arg: string | undefined): Promise<void> {
+  if (arg !== undefined && arg !== 'on' && arg !== 'off') throw new Error('requests takes "on" or "off" (or nothing, to show the setting)');
+  let res;
+  try {
+    res = arg ? await proxyRequest(config, `${config.proxy.path}/api/log-requests/${arg}`, 'POST') : await proxyRequest(config, `${config.proxy.path}/api/state`);
+  } catch {
+    throw new Error(`the proxy isn't answering on :${config.proxy.port} (portctl start ${PROXY})`);
+  }
+  if (res.status === 401) throw new Error(`proxy rejected the password: check SWITCH_PASSWORD in ${ENV_FILE}`);
+  if (res.status !== 200) throw new Error(`proxy refused: ${res.body.trim()}`);
+  const on = !!JSON.parse(res.body).logRequests;
+  console.log(`request log: ${on ? 'on (see portctl logs proxy)' : 'off'}`);
+}
+
 async function cliSwitch(config: Config, port: number | null, label: string): Promise<void> {
   let res;
   try {
@@ -682,6 +706,7 @@ async function main(argv: string[]): Promise<void> {
   const pickCmd = cmd as PickCmd;
 
   if (cmd === 'shutdown') return runAll(config, 'stop', true);
+  if (cmd === 'requests') return cliRequests(config, opts.names[0]);
   if (opts.all) {
     if (!isAction(pickCmd)) throw new Error(`--all doesn't apply to ${cmd}`);
     const withProxy = opts.names.length > 0 && opts.names.every((n) => n === PROXY || n === 'self');
